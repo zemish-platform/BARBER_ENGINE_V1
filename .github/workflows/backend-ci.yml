@@ -1,0 +1,59 @@
+name: Backend CI
+
+# Read-only validation of the backend. No deployment, no secrets, no database,
+# no production access. Runs only checks that need nothing but the repository.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [staging]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-ci:
+    name: backend-ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies (lockfile only)
+        run: npm ci --no-audit --no-fund
+
+      - name: Syntax check (parse only, nothing is executed)
+        run: |
+          find . -type f \( -name "*.js" -o -name "*.mjs" \) -not -path "./node_modules/*" -print0 \
+            | xargs -0 -n1 node --check
+
+      - name: Static regression checks (read source files only; no database, no network)
+        run: |
+          node scripts/verifyCheckInPushChannel.js
+          node scripts/verifyRatingRequestPushChannels.js
+          node scripts/verifyServiceProgressPushChannels.js
+
+      - name: App import smoke test (no database, no Redis, no network connections)
+        env:
+          NODE_ENV: test
+          SKIP_REDIS_AUTOCONNECT: "true"
+          RAZORPAY_KEY_ID: ci-placeholder
+          RAZORPAY_KEY_SECRET: ci-placeholder
+        run: node --input-type=module -e 'await import("./app.js"); console.log("app import ok"); process.exit(0)'
