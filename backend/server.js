@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "./config/stagingBootGuard.js"; // must stay directly after dotenv and BEFORE app.js — see that file
 import http from "http";
 import mongoose from "mongoose"; // ← IMPROVEMENT-2: needed for DB close + health check
 import app from "./app.js";

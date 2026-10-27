@@ -62,6 +62,14 @@
 
 import crypto from "crypto";
 import logger from "../../../utils/logger.js";
+import {
+  isStagingEnv,
+  isStagingTestPhone,
+  stagingTestOtpFor,
+  stagingUnusableOtp,
+  STAGING_OTP_ATTEMPT_LIMIT,
+  STAGING_OTP_ATTEMPT_WINDOW_SECONDS,
+} from "../../../utils/stagingGuards.js";
 import { resolveProvider } from "../providers/index.js";
 import OtpAuditOutbox from "../models/OtpAuditOutbox.js";
 import { OTP_PURPOSE, REDIS_BACKED_PURPOSES } from "../constants/otpPurpose.constants.js";
@@ -81,10 +89,24 @@ const ALLOW_FIXED_OTP = () => process.env.ALLOW_FIXED_OTP === "true";
 
 // ─── PURE PRIMITIVES ────────────────────────────────────────────────
 
-export const generateOtp = () => {
+// STAGING (NODE_ENV=staging only — see utils/stagingGuards.js): never the legacy
+// fixed code. A phone listed in STAGING_TEST_LOGINS gets its own secret OTP; any
+// other phone (or no phone at all) gets an unusable non-numeric token that is
+// hashed like a real OTP and delivered nowhere. Every other environment is
+// unchanged — `phone` is ignored.
+export const generateOtp = ({ phone } = {}) => {
+  if (isStagingEnv()) return stagingTestOtpFor(phone) ?? stagingUnusableOtp();
   if (ALLOW_FIXED_OTP()) return DEV_FIXED_OTP;
   return crypto.randomInt(100000, 999999).toString();
 };
+
+// Verify-attempt policy handed to the (unchanged) VERIFY_SCRIPT. Staging uses a
+// slower policy for EVERY phone — listed or not — so the lockout behaviour can't
+// be used to tell them apart. Other environments keep the original constants.
+const attemptPolicy = () =>
+  isStagingEnv()
+    ? { limit: STAGING_OTP_ATTEMPT_LIMIT, windowSeconds: STAGING_OTP_ATTEMPT_WINDOW_SECONDS }
+    : { limit: OTP_ATTEMPT_LIMIT, windowSeconds: OTP_ATTEMPT_WINDOW_SECONDS };
 
 export const hashOtp = (otp) => crypto.createHash("sha256").update(otp).digest("hex");
 
@@ -133,7 +155,9 @@ const assertPurpose = (purpose, fnName) => {
 // Single allow-list flag (ALLOW_FIXED_OTP) — see server.js's own
 // unchanged boot guardrail and this file's own Revision 4 guard above
 // for why this can never reach a real NODE_ENV=production deploy.
-const shouldEchoOtpInResponse = () => ALLOW_FIXED_OTP();
+// Never on staging, whatever the flags say (the boot guard also refuses
+// ALLOW_FIXED_OTP there; this is the second, independent layer).
+const shouldEchoOtpInResponse = () => !isStagingEnv() && ALLOW_FIXED_OTP();
 
 // ─── REVISION 1 — ASYNCHRONOUS AUDIT ────────────────────────────────
 //
@@ -293,7 +317,7 @@ export const sendOtp = async ({ phone, purpose, role = null, req = null, redis }
     return { success: false, code: "RESEND_TOO_SOON", retryAfterSeconds: lock.retryAfterSeconds };
   }
 
-  const otp = generateOtp();
+  const otp = generateOtp({ phone });
   // Revision 2 — the stored VALUE is now {hash, purpose}, not a bare
   // hash string. Verify compares BOTH fields atomically (see
   // VERIFY_SCRIPT) — purpose is a first-class, immutable part of the
@@ -388,13 +412,23 @@ export const verifyOtp = async ({ phone, purpose, otp, role = null, req = null, 
   }
 
   const suppliedHash = hashOtp(otp);
-  const [success, code] = await redis.eval(VERIFY_SCRIPT, {
+  const { limit, windowSeconds } = attemptPolicy();
+  const [success, scriptCode] = await redis.eval(VERIFY_SCRIPT, {
     keys: [hashKey(role, purpose, phone), attemptKey(role, purpose, phone)],
-    arguments: [suppliedHash, String(OTP_ATTEMPT_LIMIT), String(OTP_ATTEMPT_WINDOW_SECONDS), purpose],
+    arguments: [suppliedHash, String(limit), String(windowSeconds), purpose],
   });
 
   const { ip, userAgent, deviceId } = extractRequestContext(req);
-  const ok = success === 1;
+
+  // STAGING VETO — only phones listed in STAGING_TEST_LOGINS can ever succeed.
+  // Applied AFTER the script so attempt counting, lockouts and audit rows are
+  // identical for listed and unlisted phones. Even if a stored hash happened to
+  // match (e.g. a Redis shared with a fixed-OTP dev instance), an unlisted phone
+  // gets the same result as a wrong OTP, and no controller reaches user/session
+  // creation (they all gate on `attempt.ok`).
+  const stagingVeto = success === 1 && isStagingEnv() && !isStagingTestPhone(phone);
+  const ok = success === 1 && !stagingVeto;
+  const code = stagingVeto ? "INVALID_OTP" : scriptCode;
 
   safeAuditWrite({
     phone,

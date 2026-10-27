@@ -99,6 +99,7 @@ import mongoose    from "mongoose";
 import Booking from "../models/Booking.js";
 import User    from "../models/User.js";
 import SupportTeam from "../modules/support/models/SupportTeam.js";
+import { isStrictCorsEnv } from "../utils/stagingGuards.js"; // staging-only strict CORS (production already strict)
 
 //////////////////////////////////////////////////////////////
 // 🔥 CONFIG
@@ -263,7 +264,7 @@ export const initSocket = (httpServer) => {
         // No Origin header (native mobile clients, server-to-server) —
         // same allowance app.js's Express CORS already makes.
         if (!origin) return callback(null, true);
-        if (process.env.NODE_ENV !== "production") return callback(null, true);
+        if (!isStrictCorsEnv()) return callback(null, true); // dev/test only — production AND staging are strict
         if (allowedOrigins.includes(origin)) return callback(null, true);
         console.warn(`🚫 [Socket] CORS blocked: ${origin}`);
         return callback(new Error("Not allowed by CORS"));
