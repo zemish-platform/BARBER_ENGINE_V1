@@ -50,6 +50,13 @@ jobs:
           node scripts/verifyRatingRequestPushChannels.js
           node scripts/verifyServiceProgressPushChannels.js
 
+      # Behavioural, hermetic: real boot guard / OTP service / controllers / Express app
+      # with in-memory Redis and stubbed models. Loopback (127.0.0.1) only; no database,
+      # no external network, no credentials. The real-Lua section (--real-lua) needs a
+      # local redis-server and is deliberately NOT run in CI.
+      - name: Staging security guards (behavioural; in-memory Redis, loopback only)
+        run: node scripts/verifyStagingGuards.js
+
       - name: App import smoke test (no database, no Redis, no network connections)
         env:
           NODE_ENV: test
