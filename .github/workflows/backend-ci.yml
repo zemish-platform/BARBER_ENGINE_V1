@@ -4,9 +4,9 @@ name: Backend CI
 # no production access. Runs only checks that need nothing but the repository.
 on:
   pull_request:
-    branches: [main]
+    branches: [main, develop]
   push:
-    branches: [staging]
+    branches: [develop]
 
 permissions:
   contents: read
