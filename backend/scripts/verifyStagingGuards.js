@@ -224,6 +224,9 @@ const safeStagingEnv = () => ({
   RAZORPAY_KEY_SECRET: `synthetic-${rnd(6)}`,
   MONGODB_URI: withUserinfo("mongodb+srv", "cluster0.invalid/barber_engine_staging?retryWrites=true&w=majority"),
   REDIS_URL: withUserinfo("rediss", "redis.invalid:6379"),
+  // Mandatory deny-lists: fingerprints of FICTIONAL production endpoints (random, match none of the fixtures).
+  STAGING_FORBIDDEN_MONGO_ENDPOINTS: rnd(8),
+  STAGING_FORBIDDEN_REDIS_ENDPOINTS: rnd(8),
   JWT_ACCESS_SECRET: rnd(24),
   OTP_SECRET: rnd(24),
   OTP_ENCRYPT_KEY: rnd(24),
@@ -540,9 +543,9 @@ const G2_CASES = [
   ["CALL_PROVIDER set", mutate({ CALL_PROVIDER: "x" }), "CALL_PROVIDER"],
   ["BOT_PROVIDER set", mutate({ BOT_PROVIDER: "x" }), "BOT_PROVIDER"],
   ["MONGODB_URI missing", without("MONGODB_URI"), "MONGODB_URI is not set"],
-  ["MONGODB_URI with no database path", mutate({ MONGODB_URI: withUserinfo("mongodb+srv", "cluster0.invalid/?retryWrites=true") }), "name the database explicitly"],
-  ["MONGODB_URI database barber_engine_v1", mutate({ MONGODB_URI: withUserinfo("mongodb+srv", "cluster0.invalid/barber_engine_v1?x=1") }), "barber_engine_staging"],
-  ["MONGODB_URI database test", mutate({ MONGODB_URI: withUserinfo("mongodb", "h1.invalid:27017,h2.invalid:27017/test") }), "barber_engine_staging"],
+  ["MONGODB_URI with no database path", mutate({ MONGODB_URI: withUserinfo("mongodb+srv", "cluster0.invalid/?retryWrites=true") }), "not a valid MongoDB URI"],
+  ["MONGODB_URI database barber_engine_v1", mutate({ MONGODB_URI: withUserinfo("mongodb+srv", "cluster0.invalid/barber_engine_v1?retryWrites=true") }), "shared development database"],
+  ["MONGODB_URI database test", mutate({ MONGODB_URI: withUserinfo("mongodb", "h1.invalid:27017,h2.invalid:27017/test") }), "not allowed on staging"],
   ["REDIS_URL missing", without("REDIS_URL"), "REDIS_URL is not set"],
   ["REDIS_URL wrong scheme", mutate({ REDIS_URL: "http://redis.invalid:6379" }), "redis:// or rediss://"],
   ["JWT_ACCESS_SECRET missing", without("JWT_ACCESS_SECRET"), "JWT_ACCESS_SECRET"],
@@ -852,6 +855,12 @@ await test("G7", "no sentinel OTP/phone reaches any console, stdout, stderr or l
   worst.MONGODB_URI = `${uriScheme("mongodb+srv")}${tok("MONGODB_URI")}:${tokens.MONGODB_URI}@${tokens.MONGODB_URI}.invalid/${tokens.MONGODB_URI}`;
   worst.REDIS_URL = `http://${tok("REDIS_URL")}:${tokens.REDIS_URL}@${tokens.REDIS_URL}`;
   worst.CORS_ORIGIN = `*,http://${tok("CORS_ORIGIN")}.invalid,https://${tokens.CORS_ORIGIN}.invalid/path, https://${tokens.CORS_ORIGIN}.invalid`;
+  // New staging-isolation variables: malformed deny-lists, an acknowledgment value, and a Render identity.
+  worst.STAGING_FORBIDDEN_MONGO_ENDPOINTS = `${tok("STAGING_FORBIDDEN_MONGO_ENDPOINTS")},zz`;
+  worst.STAGING_FORBIDDEN_REDIS_ENDPOINTS = `${tok("STAGING_FORBIDDEN_REDIS_ENDPOINTS")},zz`;
+  worst.STAGING_ACK_SHARED_DEV_DATABASE = tok("STAGING_ACK_SHARED_DEV_DATABASE");
+  worst.RENDER = "true";
+  worst.RENDER_SERVICE_NAME = tok("RENDER_SERVICE_NAME");
   const worstMessages = assertStagingSafety(worst);
   expect(worstMessages.length >= 25, "worst-case sweep did not exercise the guard rules (too few violations)");
   const sweepText = [

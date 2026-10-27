@@ -25,6 +25,8 @@ import { startNotificationRetryJob } from "./modules/notifications/jobs/notifica
 import { startCashfreePayoutReconcileJob } from "./modules/fieldAgent/jobs/cashfreePayoutReconcile.job.js"; // ← FA-P4-D Step 1 — polls in-flight Cashfree Field Agent payouts whose webhook never arrived; idempotent, multi-instance safe
 import { startGenericPayoutReconcileJob } from "./modules/payout/jobs/genericPayoutReconcile.job.js"; // ← STEP 6.4 — polls in-flight RAZORPAY_ROUTE GenericPayoutRequest payouts whose webhook never arrived; idempotent, multi-instance safe; safe no-op when Razorpay Route isn't configured
 import { initSocket } from "./socket/index.js";
+import { isStagingEnv } from "./utils/stagingGuards.js";
+import { runStagingPreflight, runStagingStartupGate } from "./utils/stagingStartupGate.js";
 
 //////////////////////////////////////////////////////////////
 // 🔑 STEP 1: LOAD ENVIRONMENT VARIABLES
@@ -52,7 +54,16 @@ if (process.env.NODE_ENV === "production" && process.env.ALLOW_FIXED_OTP === "tr
 // 🔑 STEP 2: CONNECT DATABASE (MongoDB)
 //////////////////////////////////////////////////////////////
 
-connectDB();
+// STAGING ONLY: verify the target and the credentials' scope with a raw, read-only driver client BEFORE
+// Mongoose connects. Once Mongoose connects it creates collections/indexes for every model (autoIndex),
+// which would otherwise happen before any post-connect check could reject the credentials.
+// Skipped entirely on production and local development (no await, no extra connection).
+if (isStagingEnv()) {
+  const stagingPreflight = await runStagingPreflight({ MongoClient: mongoose.mongo.MongoClient });
+  if (!stagingPreflight.ok) process.exit(1);
+}
+
+const dbConnected = connectDB(); // same call, same moment as before; the promise is only used by the staging gate below
 
 //////////////////////////////////////////////////////////////
 // 🔑 STEP 3: REDIS LIFECYCLE LOGGING
@@ -102,6 +113,22 @@ try {
 //////////////////////////////////////////////////////////////
 
 app.set("io", io);
+
+//////////////////////////////////////////////////////////////
+// 🔒 STEP 7a: STAGING STARTUP GATE (staging only — skipped entirely elsewhere)
+//
+// Nothing below this line — no background job, no httpServer.listen() — runs
+// on staging until the live MongoDB connection has been verified: connected
+// database name + every effective privilege scoped to that one database
+// (see utils/stagingStartupGate.js). On any failure the process exits here.
+// On production and local development this block is not executed at all, so
+// their startup order and timing are unchanged.
+//////////////////////////////////////////////////////////////
+
+if (isStagingEnv()) {
+  const stagingGate = await runStagingStartupGate(dbConnected, { mongoose });
+  if (!stagingGate.ok) process.exit(1);
+}
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7b: START HOLD EXPIRY BACKGROUND JOB

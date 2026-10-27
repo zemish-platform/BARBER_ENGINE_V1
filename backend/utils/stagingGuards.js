@@ -48,16 +48,66 @@
  *  Rotating the secret does not clear a counter. Attempts are visible in the
  *  OtpAuditLog collection (phone, purpose, status, ip, failureReason).
  *
- * ── What the code cannot prove ───────────────────────────────────────
- *  The boot guard pins the Mongo database NAME and requires a REDIS_URL, but it
- *  cannot tell whether those endpoints are separate from production or local
- *  development. A human must confirm that in the Atlas / Redis dashboards.
+ * ── Staging DATABASE POLICY (utils/mongoTarget.js decides what MONGODB_URI means) ──
+ *  The database named by MONGODB_URI is read with the MongoDB driver's own parser, never a
+ *  regex, and must be one of exactly two names:
+ *    1. barber_engine_staging  — the dedicated staging database (default; no extra setting).
+ *    2. barber_engine_v1       — the shared DEVELOPMENT/TEST database. This is the founder's
+ *       approved choice for now, but it is the same data the developer's local backend uses, so
+ *       it is only accepted when STAGING_ACK_SHARED_DEV_DATABASE is set to exactly
+ *       "barber_engine_v1" (an explicit, deliberate acknowledgment — a leftover URI cannot
+ *       silently satisfy it).
+ *  Any other database name, a missing/ambiguous database, or an unparseable URI refuses to boot.
+ *  Sharing barber_engine_v1 means staging background jobs and tester logins write to the same
+ *  documents as local development; the code cannot prevent that, only make it explicit.
+ *
+ * ── Endpoint deny-lists (both REQUIRED on staging) ───────────────────────────
+ *  STAGING_FORBIDDEN_MONGO_ENDPOINTS / STAGING_FORBIDDEN_REDIS_ENDPOINTS hold comma-separated
+ *  16-hex fingerprints of the PRODUCTION endpoints (compute them with
+ *  scripts/fingerprintEndpoint.js from the production service's values — nothing is printed
+ *  but the fingerprint). Staging refuses to boot if its own MONGODB_URI / REDIS_URL endpoint
+ *  matches an entry, or if either list is missing or malformed. Requiring the lists is what turns
+ *  "production isolation" from an assumption into something the founder must declare.
+ *  Neither hosts nor fingerprints are ever printed (messages name only the variable).
+ *
+ * ── Startup verification (utils/stagingStartupGate.js, wired in server.js) ───
+ *  1. Pre-flight, BEFORE mongoose.connect(): a raw driver client runs the read-only
+ *     `connectionStatus` (showPrivileges) and is closed; the database must satisfy the policy and
+ *     every effective privilege must be scoped to that one database. A refused boot writes nothing.
+ *  2. Post-connect gate (defense in depth): jobs and HTTP listening start only after the live
+ *     Mongoose connection is verified the same way (connected database name, authenticated user,
+ *     privileges scoped to that one database).
+ *
+ * ── What the code still cannot prove ─────────────────────────────────────────
+ *  - That a fingerprint list is COMPLETE or CORRECT: it only contains what the founder declared.
+ *  - That barber_engine_v1 is not used by production under a hostname form we do not normalise.
+ *  - Anything about Redis beyond its endpoint: keys have no environment prefix, so a shared
+ *    Redis would share OTP/session namespaces. A human must confirm separation in the dashboards.
+ *  - Mongo collection/index builds (autoIndex: true) still happen after a PASSED pre-flight; they are
+ *    confined to the allowed database, whose credentials were just proven scoped to it.
+ *  - Background jobs still act on whatever data the allowed database holds (shared barber_engine_v1):
+ *    the job allow-list is a separate, not-yet-implemented change.
+ *  - Render identity depends on RENDER_SERVICE_NAME / RENDER_GIT_BRANCH being what Render documents.
+ *    A staging service that was RENAMED, deploys a branch other than develop, was left at Render's
+ *    default NODE_ENV=production AND carries none of the staging-only variables (R-ID-6) looks exactly
+ *    like production and is not detected; only pinning NODE_ENV=staging in its configuration prevents it.
  */
 
 import crypto from "node:crypto";
+import { assertEnvironmentIdentity } from "./environmentIdentity.js";
+import {
+  mongoFingerprints,
+  parseFingerprintList,
+  parseMongoTarget,
+  parseRedisTarget,
+  redisFingerprint,
+} from "./mongoTarget.js";
 
 export const STAGING_ENV_NAME = "staging";
 export const STAGING_DB_NAME = "barber_engine_staging";
+export const STAGING_SHARED_DEV_DB_NAME = "barber_engine_v1";
+export const STAGING_ALLOWED_DB_NAMES = Object.freeze([STAGING_DB_NAME, STAGING_SHARED_DEV_DB_NAME]);
+export const STAGING_SHARED_DEV_ACK_VAR = "STAGING_ACK_SHARED_DEV_DATABASE";
 export const MAX_STAGING_TEST_LOGINS = 25;
 
 // Staging-only verify-attempt policy, passed to the (unchanged) Lua script.
@@ -186,12 +236,31 @@ export const maskPhoneForLog = (phone, env = process.env) => {
 
 // ─── Boot-time safety assertions ────────────────────────────────────
 
-const safeDecode = (value) => {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
+/**
+ * evaluateStagingDatabasePolicy(dbName, env) -> string | null
+ * The documented staging database policy (see the header). Returns a violation message, or null
+ * when `dbName` is acceptable. Used by the boot guard AND the post-connect startup gate.
+ */
+export const evaluateStagingDatabasePolicy = (dbName, env = process.env) => {
+  if (dbName === STAGING_DB_NAME) return null;
+  if (dbName === STAGING_SHARED_DEV_DB_NAME) {
+    return env[STAGING_SHARED_DEV_ACK_VAR] === STAGING_SHARED_DEV_DB_NAME
+      ? null
+      : `MONGODB_URI names the shared development database; set ${STAGING_SHARED_DEV_ACK_VAR} to exactly that database's name to acknowledge using it on staging`;
   }
+  return `MONGODB_URI database is not allowed on staging (allowed: ${STAGING_ALLOWED_DB_NAMES.join(", ")})`;
+};
+
+// Endpoint deny-list check shared by MongoDB and Redis. Messages name only the variables.
+const checkEndpointDenyList = ({ listVar, targetVar, rawList, targetFingerprints }) => {
+  const parsed = parseFingerprintList(rawList);
+  if (!parsed.ok) {
+    return [`${listVar} must be set to comma-separated 16-character lowercase hex fingerprints of the production endpoints (required on staging)`];
+  }
+  if (targetFingerprints && targetFingerprints.some((f) => parsed.list.has(f))) {
+    return [`${targetVar} points at an endpoint listed in ${listVar} (a production or otherwise forbidden endpoint)`];
+  }
+  return [];
 };
 
 /**
@@ -208,6 +277,10 @@ export const assertStagingSafety = (env = process.env) => {
     violations.push('NODE_ENV looks like staging but is not exactly "staging"');
     return violations;
   }
+
+  // Render identity vs NODE_ENV (inert unless RENDER === "true"). Runs for EVERY NODE_ENV: the
+  // failure it exists for is a staging service silently running with NODE_ENV=production.
+  violations.push(...assertEnvironmentIdentity(env));
 
   if (nodeEnv === "production") {
     if (isSet(env.STAGING_TEST_LOGINS)) {
@@ -283,24 +356,45 @@ export const assertStagingSafety = (env = process.env) => {
     if (isSet(env[name])) violations.push(`${name} must be unset on staging`);
   }
 
-  // R9 — explicit staging database name (a URI without a path defaults to "test").
+  // R9 — MongoDB target, read with the MongoDB driver's own parser (utils/mongoTarget.js):
+  //   explicit + unambiguous database, on the documented staging database policy, and not on a
+  //   forbidden (production) endpoint. A URI without a path would silently use "test".
+  const mongo = parseMongoTarget(env.MONGODB_URI);
   if (!isSet(env.MONGODB_URI)) {
     violations.push("MONGODB_URI is not set");
+  } else if (!mongo.ok) {
+    violations.push(
+      "MONGODB_URI is not a valid MongoDB URI that names one explicit, unambiguous database (checked with the MongoDB driver's own parser)"
+    );
   } else {
-    const match = /^mongodb(?:\+srv)?:\/\/[^/?#]+\/([^/?#]*)/.exec(env.MONGODB_URI.trim());
-    if (!match || match[1] === "") {
-      violations.push(`MONGODB_URI must name the database explicitly (path /${STAGING_DB_NAME})`);
-    } else if (safeDecode(match[1]) !== STAGING_DB_NAME) {
-      violations.push(`MONGODB_URI database name must be exactly ${STAGING_DB_NAME}`);
-    }
+    const policyViolation = evaluateStagingDatabasePolicy(mongo.dbName, env);
+    if (policyViolation) violations.push(policyViolation);
   }
+  violations.push(
+    ...checkEndpointDenyList({
+      listVar: "STAGING_FORBIDDEN_MONGO_ENDPOINTS",
+      targetVar: "MONGODB_URI",
+      rawList: env.STAGING_FORBIDDEN_MONGO_ENDPOINTS,
+      targetFingerprints: mongo.ok ? mongoFingerprints(mongo.hosts) : null,
+    })
+  );
 
-  // R10 — Redis must be configured explicitly (unset = silent localhost default).
+  // R10 — Redis must be configured explicitly (unset = silent localhost default), parse as a
+  //   redis:// or rediss:// URL, and not point at a forbidden (production) endpoint.
+  const redisTarget = parseRedisTarget(env.REDIS_URL);
   if (!isSet(env.REDIS_URL)) {
     violations.push("REDIS_URL is not set");
-  } else if (!/^rediss?:\/\/\S+$/.test(env.REDIS_URL.trim())) {
-    violations.push("REDIS_URL must be a redis:// or rediss:// URL");
+  } else if (!redisTarget.ok) {
+    violations.push("REDIS_URL must be a valid redis:// or rediss:// URL");
   }
+  violations.push(
+    ...checkEndpointDenyList({
+      listVar: "STAGING_FORBIDDEN_REDIS_ENDPOINTS",
+      targetVar: "REDIS_URL",
+      rawList: env.STAGING_FORBIDDEN_REDIS_ENDPOINTS,
+      targetFingerprints: redisTarget.ok ? [redisFingerprint(redisTarget.host)] : null,
+    })
+  );
 
   // R11 — secrets, validated against how the code actually uses them.
   //   JWT_ACCESS_SECRET signs every access token with NO fallback

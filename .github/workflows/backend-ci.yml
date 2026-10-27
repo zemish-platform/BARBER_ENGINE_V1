@@ -57,6 +57,14 @@ jobs:
       - name: Staging security guards (behavioural; in-memory Redis, loopback only)
         run: node scripts/verifyStagingGuards.js
 
+      # Behavioural, hermetic: Render identity (service name + deployed branch) vs NODE_ENV, driver-semantics
+      # URI parsing, the staging database policy, endpoint deny-lists, the pre-flight (raw read-only check
+      # before mongoose.connect) and the post-connect gate, proven against the REAL server.js with the
+      # MongoDB layer faked (nothing ever connects; loopback only). The --real-mongo section
+      # needs a local mongod and is deliberately NOT run in CI.
+      - name: Staging isolation hardening (behavioural; faked MongoDB layer, loopback only)
+        run: node scripts/verifyStagingIsolation.js
+
       - name: App import smoke test (no database, no Redis, no network connections)
         env:
           NODE_ENV: test
