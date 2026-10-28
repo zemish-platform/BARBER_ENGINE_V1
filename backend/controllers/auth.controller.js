@@ -2,6 +2,7 @@ import Salon from "../models/Salon.js";
 import { createSession } from "../services/session.service.js";
 import { generateAccessToken } from "../services/token.service.js";
 import logger from "../utils/logger.js";
+import { maskPhoneForLog } from "../utils/stagingGuards.js";
 import { createOrFindUser, isValidOtpFormat } from "../utils/otp.helpers.js";
 import { sendOtp as sendOtpEngine, verifyOtp as verifyOtpEngine } from "../modules/otp/services/otp.service.js";
 import { OTP_PURPOSE } from "../modules/otp/constants/otpPurpose.constants.js";
@@ -47,8 +48,10 @@ const sendError = (res, status, code, message) =>
 // (Firebase/Mixpanel/etc) later without touching call sites.
 //////////////////////////////////////////////////////
 
+// Staging masks the phone ("******" + last 4 digits); every other environment
+// logs exactly what it always did (maskPhoneForLog is the identity there).
 const trackEvent = (event, props = {}) => {
-  logger.info(`[analytics] ${event}`, props);
+  logger.info(`[analytics] ${event}`, props.phone ? { ...props, phone: maskPhoneForLog(props.phone) } : props);
 };
 
 //////////////////////////////////////////////////////

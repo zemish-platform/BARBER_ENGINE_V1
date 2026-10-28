@@ -18,6 +18,7 @@ import {
 } from "../services/Razorpay.service.js";
 import { toFriendlyId } from "../utils/friendlyId.js";
 import logger from "../utils/logger.js";
+import { isStagingEnv } from "../utils/stagingGuards.js";
 
 //////////////////////////////////////////////////////////////
 // CONSTANTS
@@ -385,11 +386,13 @@ export const getWalletBalance = async (req, res) => {
 // flow automatically (see walletApi.js / WalletScreen.js).
 //
 // HARD-LOCKED to non-production — never reachable in prod even if
-// someone tries to call it directly.
+// someone tries to call it directly. Also locked on staging, where real
+// Razorpay test-mode checkout is used and this would credit wallets for free.
+// The 404 is returned before any database or wallet work.
 //////////////////////////////////////////////////////////////
 
 export const mockVerifyTopup = async (req, res) => {
-  if (process.env.NODE_ENV === "production") {
+  if (process.env.NODE_ENV === "production" || isStagingEnv()) {
     return res.status(404).json({ success: false, message: "Not found" });
   }
 
