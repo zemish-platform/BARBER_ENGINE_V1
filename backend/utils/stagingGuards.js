@@ -42,6 +42,17 @@
  *  tester-login staging no-op, so the response does not reveal the list. Verification is vetoed for
  *  every phone that is not permitted. Production and development never read these variables.
  *
+ * ── STAGING SMS OTP, STANDARD MODE (derived; no variable of its own) ──────────────
+ *  Normal MSG91 OTP delivery to every valid phone, exactly as the OTP engine behaves outside staging.
+ *  It is not switched on by a new variable: it is the staging configuration in which
+ *    SMS_PROVIDER=msg91 (exactly) with MSG91_AUTH_KEY / MSG91_TEMPLATE_ID / MSG91_SENDER_ID set,
+ *    and STAGING_SMS_OTP_MODE, STAGING_SMS_ALLOWED_PHONES and STAGING_TEST_LOGINS all unset/blank.
+ *  Any other combination keeps its previous meaning (tester logins, allowlist, or a refused boot), so a
+ *  half-configured file can never fall into this mode: a non-blank STAGING_SMS_OTP_MODE or a phone list
+ *  or tester logins rule it out. Real random OTPs; no recipient restriction; the OTP is still never
+ *  returned in a response and never logged; ALLOW_FIXED_OTP is still refused at boot; the staging
+ *  verify-attempt policy and every rate limit are unchanged. Production and development never read it.
+ *
  * ── Secret rotation ──────────────────────────────────────────────────
  *  1. Edit STAGING_TEST_LOGINS in the Render dashboard (save + deploy; an env
  *     change only takes effect on the next deploy/restart).
@@ -229,6 +240,17 @@ export const parseStagingTestLogins = (raw) => {
 export const getStagingSmsMode = (env = process.env) =>
   env[STAGING_SMS_MODE_VAR] === STAGING_SMS_MODE_ALLOWLIST ? STAGING_SMS_MODE_ALLOWLIST : null;
 
+// True only on staging, only when the configuration is exactly the STANDARD SMS MODE described in the header: the
+// provider is msg91 and none of the three restricting settings (SMS mode, phone allowlist, tester logins) is in use.
+// A non-blank STAGING_SMS_OTP_MODE counts as "in use" even when its value is unsupported (that is a refused boot,
+// never a silent fall-through to unrestricted sending).
+export const isStagingStandardSmsMode = (env = process.env) =>
+  env.NODE_ENV === STAGING_ENV_NAME &&
+  env.SMS_PROVIDER === "msg91" &&
+  !isSet(env[STAGING_SMS_MODE_VAR]) &&
+  !isSet(env[STAGING_SMS_ALLOWED_PHONES_VAR]) &&
+  !isSet(env.STAGING_TEST_LOGINS);
+
 /**
  * parseStagingSmsAllowedPhones(raw) -> { phones: Set<string>, errors: string[] }
  * Comma-separated 10-digit phones (first digit 6-9), no prefix, no duplicates, at most 25.
@@ -280,9 +302,9 @@ export const isStagingSmsPhoneAllowed = (phone, env = process.env) => {
   return canonical !== null && parseStagingSmsAllowedPhones(env[STAGING_SMS_ALLOWED_PHONES_VAR]).phones.has(canonical);
 };
 
-// May this phone complete a staging OTP login at all? (tester login OR SMS-allowlisted)
+// May this phone complete a staging OTP login at all? (tester login, SMS-allowlisted, or any phone in standard mode)
 export const isStagingPermittedPhone = (phone, env = process.env) =>
-  isStagingTestPhone(phone, env) || isStagingSmsPhoneAllowed(phone, env);
+  isStagingStandardSmsMode(env) || isStagingTestPhone(phone, env) || isStagingSmsPhoneAllowed(phone, env);
 
 // A non-numeric token no 4- or 6-digit input can ever match. Used as the "OTP"
 // for unlisted phones: it is hashed and stored like a real one, and goes nowhere.
@@ -359,10 +381,12 @@ export const assertStagingSafety = (env = process.env) => {
 
   if (nodeEnv !== STAGING_ENV_NAME) return violations; // development / test / unset
 
-  // R1/R2 — how testers log in: EITHER per-tester secret OTPs (STAGING_TEST_LOGINS, no SMS) OR real SMS OTPs to an
-  // explicit allowlist (STAGING_SMS_OTP_MODE=allowlist). Never both; never neither.
+  // R1/R2 — how people log in: per-tester secret OTPs (STAGING_TEST_LOGINS, no SMS), OR real SMS OTPs to an explicit
+  // allowlist (STAGING_SMS_OTP_MODE=allowlist), OR the standard mode (msg91 with none of the restrictions above, see
+  // header). Never a mix; never none of them.
   const smsModeRaw = env[STAGING_SMS_MODE_VAR];
   const smsAllowlist = smsModeRaw === STAGING_SMS_MODE_ALLOWLIST;
+  const smsStandard = isStagingStandardSmsMode(env);
   if (isSet(smsModeRaw) && !smsAllowlist) {
     violations.push(`${STAGING_SMS_MODE_VAR} must be unset or exactly "${STAGING_SMS_MODE_ALLOWLIST}" (the only supported staging SMS mode)`);
   }
@@ -380,10 +404,12 @@ export const assertStagingSafety = (env = process.env) => {
       violations.push(...phoneErrors);
       if (phoneErrors.length === 0 && phones.size === 0) violations.push(`${STAGING_SMS_ALLOWED_PHONES_VAR} has no valid entries`);
     }
-  } else {
+  } else if (!smsStandard) {
     const { logins, errors } = parseStagingTestLogins(env.STAGING_TEST_LOGINS);
     if (!isSet(env.STAGING_TEST_LOGINS)) {
-      violations.push("STAGING_TEST_LOGINS is not set (at least one test login is required)");
+      violations.push(
+        `STAGING_TEST_LOGINS is not set (at least one test login is required, unless SMS_PROVIDER=msg91 selects the standard SMS mode, or ${STAGING_SMS_MODE_VAR}=${STAGING_SMS_MODE_ALLOWLIST})`
+      );
     } else {
       violations.push(...errors);
       if (errors.length === 0 && logins.size === 0) {
@@ -421,18 +447,19 @@ export const assertStagingSafety = (env = process.env) => {
     violations.push("CASHFREE_PAYOUT_BASE_URL must be unset on staging");
   }
 
-  // R6 — no paid KYC; SMS only through the deliberate allowlist mode (MSG91 only).
+  // R6 — no paid KYC; real SMS only in the allowlist or standard mode (MSG91 only).
   if (isSet(env.SUREPASS_TOKEN)) violations.push("SUREPASS_TOKEN must be unset on staging");
-  if (smsAllowlist) {
+  if (smsAllowlist || smsStandard) {
+    const why = smsAllowlist ? `${STAGING_SMS_MODE_VAR}=${STAGING_SMS_MODE_ALLOWLIST}` : "SMS_PROVIDER=msg91 on staging (standard SMS mode)";
     if (env.SMS_PROVIDER !== "msg91") {
       violations.push(`SMS_PROVIDER must be exactly "msg91" when ${STAGING_SMS_MODE_VAR}=${STAGING_SMS_MODE_ALLOWLIST}`);
     }
     for (const name of ["MSG91_AUTH_KEY", "MSG91_TEMPLATE_ID", "MSG91_SENDER_ID"]) {
-      if (!isSet(env[name])) violations.push(`${name} must be set when ${STAGING_SMS_MODE_VAR}=${STAGING_SMS_MODE_ALLOWLIST}`);
+      if (!isSet(env[name])) violations.push(`${name} must be set when ${why}`);
     }
   } else {
     if (isSet(env.SMS_PROVIDER) && env.SMS_PROVIDER.trim().toLowerCase() !== "none") {
-      violations.push(`SMS_PROVIDER must be unset or "none" on staging (real SMS needs ${STAGING_SMS_MODE_VAR}=${STAGING_SMS_MODE_ALLOWLIST})`);
+      violations.push(`SMS_PROVIDER must be unset or "none" on staging (real SMS needs ${STAGING_SMS_MODE_VAR}=${STAGING_SMS_MODE_ALLOWLIST}, or the standard mode: SMS_PROVIDER=msg91 with STAGING_TEST_LOGINS, ${STAGING_SMS_MODE_VAR} and ${STAGING_SMS_ALLOWED_PHONES_VAR} all unset)`);
     }
     if (Object.keys(env).some((k) => /^MSG91_/.test(k) && isSet(env[k]))) {
       violations.push(`MSG91_* variables must be unset on staging (real SMS needs ${STAGING_SMS_MODE_VAR}=${STAGING_SMS_MODE_ALLOWLIST})`);

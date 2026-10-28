@@ -1395,6 +1395,336 @@ await test("S10", "PRODUCTION and DEVELOPMENT regression: the raw provider is re
   expect(providers.resolveProvider !== undefined && typeof providers.getMsg91CircuitBreakerState === "function", "provider exports changed");
 });
 
+// ─── M — staging SMS OTP, STANDARD mode (derived: SMS_PROVIDER=msg91, no tester logins / SMS mode / allowlist) ─────
+section("M  staging SMS OTP standard mode (real controllers + OTP service + MSG91 provider code; fetch STUBBED — no network, no real SMS)");
+
+const FA_ROLE = (await import("../modules/fieldAgent/constants/fieldAgent.constants.js")).FIELD_AGENT_OTP_ROLE;
+const { sendFieldAgentOtp } = await import("../modules/fieldAgent/controllers/fieldAgentAuth.controller.js");
+const { sendFieldAgentOperationalOtp } = await import("../modules/fieldAgent/controllers/fieldAgentOperationalAuth.controller.js");
+const { sendOwnerVerificationOtp } = await import("../modules/fieldAgent/services/assistedOnboarding.service.js");
+
+const STD_MSG91 = { SMS_PROVIDER: "msg91", MSG91_AUTH_KEY: MSG91_KEY, MSG91_TEMPLATE_ID: `tpl${rnd(3)}`, MSG91_SENDER_ID: "ZEMSH1" };
+// Complete standard-mode staging config for the boot guard: NO tester logins, NO SMS mode, NO allowlist.
+const stdGuardEnv = (over = {}) => { const e = { ...safeStagingEnv(), ...STD_MSG91 }; delete e.STAGING_TEST_LOGINS; return { ...e, ...over }; };
+const STD_RUNTIME = {
+  NODE_ENV: "staging", STAGING_TEST_LOGINS: undefined, STAGING_SMS_OTP_MODE: undefined, STAGING_SMS_ALLOWED_PHONES: undefined,
+  ALLOW_FIXED_OTP: undefined, PUSH_PROVIDER: undefined, ...STD_MSG91,
+};
+const STD_PHONES = [PHONE_U1, PHONE_L3, "9876543210", "7000000001"]; // none listed anywhere; standard mode must not care
+const makeResSet = () => { const r = makeRes(); r.set = (k, v) => { r.headers[k] = v; return r; }; r.nextError = null; return r; };
+const nextRec = (res) => (err) => { res.nextError = err; };
+const sentOtps = []; // every OTP the stubbed provider was ever handed — used by the privacy sweeps
+
+await test("M1", "boot guard: standard mode (msg91, no tester logins / SMS mode / allowlist) is accepted; every partial, mixed or unsupported variant is refused; all other staging rules still apply", async () => {
+  expect(assertStagingSafety(stdGuardEnv()).length === 0, `a complete standard config was refused: ${assertStagingSafety(stdGuardEnv()).join(" | ")}`);
+  expect(assertStagingSafety(stdGuardEnv({ ALLOW_FIXED_OTP: "false" })).length === 0, "ALLOW_FIXED_OTP=false should be accepted");
+  expect(assertStagingSafety(stdGuardEnv({ STAGING_SMS_OTP_MODE: "  " })).length === 0, "a blank SMS mode should count as unset");
+  const base = stdGuardEnv();
+  const bad = [
+    ["ALLOW_FIXED_OTP=true", stdGuardEnv({ ALLOW_FIXED_OTP: "true" }), /ALLOW_FIXED_OTP must be unset or false/],
+    ["MSG91_AUTH_KEY missing", withoutKey(base, "MSG91_AUTH_KEY"), /MSG91_AUTH_KEY must be set/],
+    ["MSG91_TEMPLATE_ID missing", withoutKey(base, "MSG91_TEMPLATE_ID"), /MSG91_TEMPLATE_ID must be set/],
+    ["MSG91_SENDER_ID blank", stdGuardEnv({ MSG91_SENDER_ID: " " }), /MSG91_SENDER_ID must be set/],
+    ["SMS_PROVIDER unset, no tester logins", withoutKey(base, "SMS_PROVIDER"), /STAGING_TEST_LOGINS is not set/],
+    ["SMS_PROVIDER none, no tester logins", stdGuardEnv({ SMS_PROVIDER: "none" }), /STAGING_TEST_LOGINS is not set/],
+    ["SMS_PROVIDER MSG91 (case)", stdGuardEnv({ SMS_PROVIDER: "MSG91" }), /STAGING_TEST_LOGINS is not set/],
+    ["SMS_PROVIDER ' msg91' (whitespace)", stdGuardEnv({ SMS_PROVIDER: " msg91" }), /STAGING_TEST_LOGINS is not set/],
+    ["SMS_PROVIDER twilio", stdGuardEnv({ SMS_PROVIDER: "twilio" }), /SMS_PROVIDER must be unset or "none"/],
+    ["SMS_PROVIDER aws_sns", stdGuardEnv({ SMS_PROVIDER: "aws_sns" }), /SMS_PROVIDER must be unset or "none"/],
+    ["msg91 together with tester logins (mixed)", stdGuardEnv({ STAGING_TEST_LOGINS: loginsValue() }), /SMS_PROVIDER must be unset or "none"/],
+    ["unsupported SMS mode 'open' + msg91", stdGuardEnv({ STAGING_SMS_OTP_MODE: "open" }), /unset or exactly "allowlist"/],
+    ["SMS mode 'Allowlist' (case) + msg91", stdGuardEnv({ STAGING_SMS_OTP_MODE: "Allowlist" }), /unset or exactly "allowlist"/],
+    ["SMS mode 'standard' + msg91", stdGuardEnv({ STAGING_SMS_OTP_MODE: "standard" }), /unset or exactly "allowlist"/],
+    ["allowlist phones without the mode + msg91", stdGuardEnv({ STAGING_SMS_ALLOWED_PHONES: PHONE_L1 }), /is set but STAGING_SMS_OTP_MODE is not "allowlist"/],
+    ["TWILIO_* set", stdGuardEnv({ TWILIO_ACCOUNT_SID: `AC${rnd(4)}` }), /TWILIO_\* variables must be unset/],
+    ["SUREPASS_TOKEN set", stdGuardEnv({ SUREPASS_TOKEN: rnd(6) }), /SUREPASS_TOKEN must be unset/],
+    ["PUSH_PROVIDER set", stdGuardEnv({ PUSH_PROVIDER: "expo" }), /PUSH_PROVIDER must be unset or "none"/],
+    ["live Razorpay key", stdGuardEnv({ RAZORPAY_KEY_ID: "rzp_live_x" }), /LIVE key/],
+    ["REDIS_URL missing", withoutKey(base, "REDIS_URL"), /REDIS_URL is not set/],
+    ["Mongo deny-list missing", withoutKey(base, "STAGING_FORBIDDEN_MONGO_ENDPOINTS"), /STAGING_FORBIDDEN_MONGO_ENDPOINTS must be set/],
+    ["Redis deny-list missing", withoutKey(base, "STAGING_FORBIDDEN_REDIS_ENDPOINTS"), /STAGING_FORBIDDEN_REDIS_ENDPOINTS must be set/],
+    ["database not allowed on staging", stdGuardEnv({ MONGODB_URI: withUserinfo("mongodb+srv", "cluster0.invalid/some_other_db?retryWrites=true") }), /database is not allowed on staging/],
+    ["OTP_SECRET missing", withoutKey(base, "OTP_SECRET"), /OTP_SECRET must be set/],
+  ];
+  for (const [label, env, pattern] of bad) {
+    const v = assertStagingSafety(env);
+    expect(v.some((m) => pattern.test(m)), `${label}: expected ${pattern}, got ${JSON.stringify(v)}`);
+    const text = v.join("\n");
+    expect(ALL_SENTINELS.every((x) => !text.includes(x)), `${label}: a phone / key / secret appears in a violation message`);
+  }
+  // The other two modes keep exactly their previous verdicts.
+  expect(assertStagingSafety(safeStagingEnv()).length === 0, "the tester-login configuration changed");
+  expect(assertStagingSafety(smsGuardEnv()).length === 0, "the allowlist configuration changed");
+  expect(assertStagingSafety(withoutKey(safeStagingEnv(), "STAGING_TEST_LOGINS")).some((m) => /STAGING_TEST_LOGINS is not set/.test(m)), "no SMS provider and no tester logins is no longer refused");
+  // Production / development: inert (never read), and the production tester-login refusal is unchanged.
+  for (const nodeEnv of ["production", "development", "test"]) expect(assertStagingSafety({ NODE_ENV: nodeEnv, ...STD_MSG91 }).length === 0, `${nodeEnv} is affected by the standard-mode rules`);
+  expect(assertStagingSafety({ NODE_ENV: "production", STAGING_TEST_LOGINS: loginsValue() }).some((m) => /must not be set when NODE_ENV=production/.test(m)), "production tester-login refusal changed");
+});
+
+await test("M2", "helpers: standard mode is exactly NODE_ENV=staging + SMS_PROVIDER=msg91 with nothing restricting it; any phone is then permitted; other modes and other environments are unaffected", async () => {
+  const on = { NODE_ENV: "staging", ...STD_MSG91 };
+  expect(guards.isStagingStandardSmsMode(on) === true, "standard mode not detected");
+  expect(guards.isStagingStandardSmsMode({ ...on, STAGING_SMS_OTP_MODE: "  ", STAGING_TEST_LOGINS: "", STAGING_SMS_ALLOWED_PHONES: " " }) === true, "blank restricting settings should count as unset");
+  const off = [
+    ["production", { ...on, NODE_ENV: "production" }], ["development", { ...on, NODE_ENV: "development" }], ["test", { ...on, NODE_ENV: "test" }],
+    ["NODE_ENV unset", withoutKey(on, "NODE_ENV")], ["'Staging'", { ...on, NODE_ENV: "Staging" }],
+    ["provider unset", withoutKey(on, "SMS_PROVIDER")], ["provider none", { ...on, SMS_PROVIDER: "none" }], ["provider MSG91", { ...on, SMS_PROVIDER: "MSG91" }],
+    ["provider ' msg91'", { ...on, SMS_PROVIDER: " msg91" }], ["provider twilio", { ...on, SMS_PROVIDER: "twilio" }],
+    ["tester logins set", { ...on, STAGING_TEST_LOGINS: loginsValue() }],
+    ["allowlist mode", { ...on, STAGING_SMS_OTP_MODE: "allowlist", STAGING_SMS_ALLOWED_PHONES: PHONE_L1 }],
+    ["allowlist phones without the mode", { ...on, STAGING_SMS_ALLOWED_PHONES: PHONE_L1 }],
+    ["mode 'open'", { ...on, STAGING_SMS_OTP_MODE: "open" }], ["mode 'standard'", { ...on, STAGING_SMS_OTP_MODE: "standard" }],
+  ];
+  for (const [label, env] of off) expect(guards.isStagingStandardSmsMode(env) === false, `${label}: counted as standard mode`);
+  for (const phone of [...STD_PHONES, `+91${PHONE_U1}`, "not-a-phone", "", undefined, null]) expect(guards.isStagingPermittedPhone(phone, on) === true, `'${phone}' not permitted in standard mode`);
+  expect(guards.getStagingSmsMode(on) === null && guards.getStagingTestLogins(on).size === 0 && guards.isStagingSmsPhoneAllowed(PHONE_U1, on) === false, "standard mode leaked into the allowlist / tester helpers");
+  // Other modes: permission is still per phone.
+  const tester = { NODE_ENV: "staging", STAGING_TEST_LOGINS: loginsValue() };
+  expect(guards.isStagingPermittedPhone(PHONE_L1, tester) === true && guards.isStagingPermittedPhone(PHONE_U1, tester) === false, "tester-login permission changed");
+  const allow = { NODE_ENV: "staging", ...smsVars() };
+  expect(guards.isStagingPermittedPhone(PHONE_L1, allow) === true && guards.isStagingPermittedPhone(PHONE_U1, allow) === false, "allowlist permission changed");
+});
+
+await test("M3", "generateOtp: every phone gets a real random 6-digit OTP in standard mode (never the fixed one, even with ALLOW_FIXED_OTP=true); look-alike configs still get the unusable token; production/development unchanged", async () => {
+  const gen = (env, arg) => withEnv(env, () => otpService.generateOtp(arg));
+  const seen = new Set();
+  for (let i = 0; i < 60; i += 1) {
+    const phone = [...STD_PHONES, `+91${PHONE_U1}`, undefined, {}, "x"][i % 8];
+    const v = await gen({ ...STD_RUNTIME, ALLOW_FIXED_OTP: "true" }, phone === undefined ? undefined : { phone });
+    expect(/^\d{6}$/.test(v) && v !== "123456", "standard mode did not give a random 6-digit OTP");
+    seen.add(v);
+  }
+  expect(seen.size > 40, "OTPs are not random");
+  for (const [label, env] of [
+    ["mode 'open'", { ...STD_RUNTIME, STAGING_SMS_OTP_MODE: "open" }],
+    ["tester logins present", { ...STD_RUNTIME, STAGING_TEST_LOGINS: loginsValue() }],
+    ["phones set without the mode", { ...STD_RUNTIME, STAGING_SMS_ALLOWED_PHONES: PHONE_L1 }],
+    ["provider not exactly msg91", { ...STD_RUNTIME, SMS_PROVIDER: "MSG91" }],
+  ]) {
+    const v = await gen(env, { phone: PHONE_U1 });
+    expect(!/^\d{4,6}$/.test(v), `${label}: an unrestricted OTP was issued outside standard mode`);
+  }
+  expect(/^\d{6}$/.test(await gen({ NODE_ENV: "production", ALLOW_FIXED_OTP: undefined, ...STD_MSG91 }, { phone: PHONE_U1 })), "production OTP changed");
+  expect((await gen({ NODE_ENV: "development", ALLOW_FIXED_OTP: "true", ...STD_MSG91 }, { phone: PHONE_U1 })) === "123456", "development fixed OTP changed");
+  expect((await gen({ NODE_ENV: "staging", STAGING_TEST_LOGINS: loginsValue(), SMS_PROVIDER: undefined }, { phone: PHONE_L2 })) === SECRETS.get(PHONE_L2), "tester-login mode changed");
+});
+
+await test("M4", "any phone: ONE MSG91 call with a random OTP, nothing echoed, that OTP verifies once; 30 s resend lock holds; wrong-OTP policy is the staging 10 / 7200 s one", async () => {
+  await withEnv(STD_RUNTIME, () => withFetch(okSms, async (calls) => {
+    for (const phone of STD_PHONES) {
+      const redis = makeFakeRedis();
+      const before = calls.length;
+      const r = await sendVia(redis, phone);
+      expect(r.success === true && r.provider === "msg91" && !("otp" in r), `${phone}: send failed, not routed to msg91, or echoed the otp`);
+      expect(calls.length === before + 1 && mobileFromCall(calls[before]) === `91${phone}`, `${phone}: not exactly one MSG91 call to that number`);
+      const otp = otpFromCall(calls[before]); sentOtps.push(otp);
+      expect(/^\d{6}$/.test(otp) && otp !== "123456", `${phone}: the SMS carried a non-random OTP`);
+      expect(storedHash(redis, phone) === sha256(otp), `${phone}: stored hash is not the hash of the OTP that was sent`);
+      const again = await sendVia(redis, phone);
+      expect(again.success === false && again.code === "RESEND_TOO_SOON" && calls.length === before + 1, `${phone}: the 30 s resend lock did not stop a second provider call`);
+      const wrong = otp === WRONG_OTP ? "654323" : WRONG_OTP;
+      expect((await verifyVia(redis, phone, wrong)).code === "INVALID_OTP", `${phone}: a wrong OTP was accepted`);
+      expect((await verifyVia(redis, phone, otp)).ok === true, `${phone}: the SMS OTP did not verify`);
+      expect((await verifyVia(redis, phone, otp)).ok === false, `${phone}: an OTP verified twice`);
+    }
+    // Attempt policy handed to the Lua script: staging's 10 failures / 7200 s, unchanged — and the 10th still locks.
+    const redis = makeFakeRedis();
+    await sendVia(redis, PHONE_U1);
+    const otp = otpFromCall(calls[calls.length - 1]); sentOtps.push(otp);
+    const wrong = otp === WRONG_OTP ? "654323" : WRONG_OTP;
+    for (let i = 0; i < 10; i += 1) expect((await verifyVia(redis, PHONE_U1, wrong)).code === "INVALID_OTP", `wrong attempt ${i + 1}`);
+    expect((await verifyVia(redis, PHONE_U1, otp)).code === "TOO_MANY_ATTEMPTS", "the attempt limit no longer locks after 10");
+    const args = redis.evalCalls[0].args;
+    expect(args[1] === "10" && args[2] === "7200", `verify policy changed (limit ${args[1]}, window ${args[2]})`);
+    const ttl = await redis.ttl(keyFor("USER", "LOGIN", PHONE_U1, "attempts"));
+    expect(ttl > 7000 && ttl <= 7200, "the attempt window is not 7200 s");
+  }));
+});
+
+await test("M5", "provider failures for any phone: HTTP error and network error → SMS_SEND_FAILED, counted by the circuit breaker; a success resets it", async () => {
+  await withEnv(STD_RUNTIME, async () => {
+    const stateOf = () => providers.getMsg91CircuitBreakerState().failureCount;
+    const base = stateOf();
+    await quiet(() => withFetch(failSms, async (calls) => {
+      const r = await sendVia(makeFakeRedis(), PHONE_U1);
+      expect(r.success === false && r.code === "SMS_SEND_FAILED" && calls.length === 1, "an HTTP error was not reported as SMS_SEND_FAILED");
+    }));
+    await quiet(() => withFetch(throwSms, async (calls) => {
+      const r = await sendVia(makeFakeRedis(), PHONE_L3);
+      expect(r.success === false && r.code === "SMS_SEND_FAILED" && calls.length === 1, "a network error was not reported as SMS_SEND_FAILED");
+    }));
+    expect(stateOf() === base + 2, "real failures were not counted by the circuit breaker");
+    await withFetch(okSms, async (calls) => {
+      const ok = await sendVia(makeFakeRedis(), "9876543210");
+      expect(ok.success === true && calls.length === 1 && stateOf() === 0, "a successful send did not reset the breaker");
+      sentOtps.push(otpFromCall(calls[0]));
+    });
+  });
+});
+
+await test("M6", "role-specific paths via the REAL controllers (user, owner, field-agent apply, field-agent login) and the assisted-onboarding service: unrestricted phone → one MSG91 call, no OTP in the response, resend lock, wrong OTP 401, right OTP passes", async () => {
+  const flows = [
+    { label: "user", purpose: OTP_PURPOSE.LOGIN, role: "USER", send: (q, s) => authController.sendUserOtp(q, s), verify: (q, s) => authController.verifyUserOtp(q, s), session: true },
+    { label: "owner", purpose: OTP_PURPOSE.SALON_LOGIN, role: "OWNER", send: (q, s) => authController.sendOtp(q, s), verify: (q, s) => authController.verifyOtp(q, s), session: true },
+    { label: "field-agent apply", purpose: OTP_PURPOSE.FIELD_AGENT_APPLY, role: FA_ROLE, send: (q, s) => sendFieldAgentOtp(q, s, nextRec(s)), verify: (q, s) => verifyFieldAgentOtp(q, s, nextRec(s)), session: false },
+    { label: "field-agent login", purpose: OTP_PURPOSE.FIELD_AGENT_LOGIN, role: FA_ROLE, send: (q, s) => sendFieldAgentOperationalOtp(q, s, nextRec(s)), verify: (q, s) => verifyFieldAgentOperationalOtp(q, s, nextRec(s)), session: false },
+  ];
+  await withEnv(STD_RUNTIME, () => withFetch(okSms, async (calls) => {
+    for (const f of flows) {
+      const phone = PHONE_U1; // never listed anywhere
+      const redis = makeFakeRedis();
+      const before = calls.length;
+      resetCounters();
+      const sent = makeResSet();
+      await f.send(makeReq({ phone }, redis), sent);
+      expect(sent.statusCode === 200 && sent.body?.success === true && sent.nextError === null, `${f.label}: send did not succeed (${sent.statusCode})`);
+      expect(!("otp" in (sent.body || {})), `${f.label}: the OTP was returned in the response`);
+      expect(calls.length === before + 1 && mobileFromCall(calls[before]) === `91${phone}`, `${f.label}: not exactly one MSG91 call to the requested number`);
+      const otp = otpFromCall(calls[before]); sentOtps.push(otp);
+      expect(/^\d{6}$/.test(otp) && otp !== "123456", `${f.label}: non-random OTP`);
+      expect(redis.store.has(keyFor(f.role, f.purpose, phone, "hash")), `${f.label}: hash not stored under role ${f.role} / purpose ${f.purpose}`);
+      const second = makeResSet();
+      await f.send(makeReq({ phone }, redis), second);
+      expect(calls.length === before + 1 && !(second.statusCode === 200 && second.body?.success === true), `${f.label}: a rapid second send reached the provider or succeeded`);
+      expect(second.statusCode === 429 || second.nextError, `${f.label}: the resend lock produced no 429 / error`);
+      const wrongOtp = otp === WRONG_OTP ? "654323" : WRONG_OTP;
+      const bad = makeResSet();
+      await f.verify(makeReq({ phone, otp: wrongOtp }, redis), bad);
+      expect(bad.statusCode === 401 && (bad.body?.error?.code ?? bad.body?.code) === "INVALID_OTP", `${f.label}: a wrong OTP was not a 401 INVALID_OTP`);
+      expect(noMutation(), `${f.label}: a wrong OTP reached a user/session step`);
+      const good = makeResSet();
+      await f.verify(makeReq({ phone, otp }, redis), good);
+      const pastOtp = !(good.statusCode === 401 || good.statusCode === 429);
+      expect(pastOtp, `${f.label}: the correct SMS OTP was rejected (${good.statusCode})`);
+      if (f.session) {
+        expect(good.statusCode === 200 && typeof good.body?.accessToken === "string" && good.cookies.length === 1, `${f.label}: login did not complete`);
+        expect(counters.userFindOne === 1 && counters.refreshCreate === 1, `${f.label}: session path not taken exactly once`);
+      }
+    }
+    // Assisted onboarding (a Field Agent verifies an OWNER's phone): the real service functions.
+    const redis = makeFakeRedis();
+    const before = calls.length;
+    const r = await sendOwnerVerificationOtp({ phone: PHONE_U1, req: makeReq({}, redis), redis });
+    expect(r.phone === PHONE_U1 && r.devOtp === null, "assisted onboarding returned an OTP to the caller");
+    expect(calls.length === before + 1 && mobileFromCall(calls[before]) === `91${PHONE_U1}`, "assisted onboarding: not exactly one MSG91 call");
+    const otp = otpFromCall(calls[before]); sentOtps.push(otp);
+    expect(redis.store.has(keyFor("OWNER", OTP_PURPOSE.ASSISTED_ONBOARDING_OWNER_VERIFY, PHONE_U1, "hash")), "assisted onboarding: hash not stored under its own purpose");
+    let resend = null;
+    try { await sendOwnerVerificationOtp({ phone: PHONE_U1, req: makeReq({}, redis), redis }); } catch (e) { resend = e; }
+    expect(resend && resend.retryAfterSeconds > 0 && calls.length === before + 1, "assisted onboarding: the resend lock did not hold");
+    // startAssistedOnboarding reads the agent's profile before it verifies the OTP: stub that one read (restored below).
+    const { default: FieldAgentModel } = await import("../modules/fieldAgent/models/FieldAgent.js");
+    const { FIELD_AGENT_OPERATIONAL_STATUS, COMMERCIAL_PATH } = await import("../modules/fieldAgent/constants/fieldAgent.constants.js");
+    const agentUserId = new mongoose.Types.ObjectId();
+    const realFindOne = FieldAgentModel.findOne;
+    FieldAgentModel.findOne = () => ({ lean: async () => ({ _id: new mongoose.Types.ObjectId(), userRef: agentUserId, operationalStatus: FIELD_AGENT_OPERATIONAL_STATUS.ACTIVE, commercialPath: COMMERCIAL_PATH.ACQUISITION_AGENT }) });
+    try {
+    const start = (code) => startAssistedOnboarding({ fieldAgentUserId: agentUserId.toString(), phone: PHONE_U1, otp: code, createNewBranch: false, req: makeReq({}, redis), redis });
+    let wrongErr = null;
+    try { await start(otp === WRONG_OTP ? "654323" : WRONG_OTP); } catch (e) { wrongErr = e; }
+    expect(wrongErr && wrongErr.otpCode === "INVALID_OTP", "assisted onboarding: a wrong OTP was not rejected as INVALID_OTP");
+    let rightErr = null;
+    try { await quiet(() => start(otp)); } catch (e) { rightErr = e; }
+    expect(!(rightErr && rightErr.otpCode), "assisted onboarding: the correct SMS OTP was rejected");
+    } finally { FieldAgentModel.findOne = realFindOne; }
+  }));
+});
+
+await test("M7", "no-show OTP (booking controller UNCHANGED): any customer phone gets exactly one SMS carrying the generated OTP; same provider as login", async () => {
+  await withEnv(STD_RUNTIME, () => withFetch(okSms, async (calls) => {
+    for (const phone of [PHONE_U1, PHONE_L3, "9876543210"]) { // callers hand the provider bare 10-digit phones, exactly as in production
+      const otp = otpService.generateOtp({ phone });
+      const before = calls.length;
+      const r = await otpService.dispatchOtpSms({ phone, otp, purpose: OTP_PURPOSE.BOOKING_NOSHOW });
+      expect(/^\d{6}$/.test(otp), "the no-show OTP is not a random 6-digit code");
+      expect(r.success === true && r.provider === "msg91" && calls.length === before + 1 && otpFromCall(calls[before]) === otp, `${phone}: not exactly one SMS carrying the generated OTP`);
+      sentOtps.push(otp);
+    }
+  }));
+});
+
+await test("M8", "privacy: standard mode never returns or logs an OTP, a full phone number or the MSG91 key (success, HTTP failure, network failure); audit rows carry none of them", async () => {
+  const auditStart = auditRows.length;
+  const out = await capture(async () => {
+    await withEnv({ ...STD_RUNTIME, ALLOW_FIXED_OTP: "true" }, async () => { // even with the legacy flag on, nothing is echoed
+      const bodies = [];
+      await withFetch(okSms, async (calls) => {
+        for (const phone of STD_PHONES) { const r = await sendVia(makeFakeRedis(), phone); bodies.push(JSON.stringify(r)); }
+        for (const c of calls) sentOtps.push(otpFromCall(c));
+      });
+      await withFetch(failSms, async () => { await sendVia(makeFakeRedis(), PHONE_U1); });
+      await withFetch(throwSms, async () => { await sendVia(makeFakeRedis(), PHONE_L3); });
+      await withFetch(okSms, async (calls) => { await sendVia(makeFakeRedis(), "9876543210"); sentOtps.push(otpFromCall(calls[0])); }); // close the breaker again
+      const joined = bodies.join("\n");
+      for (const o of sentOtps) expect(!joined.includes(`"otp":"${o}"`) && !/"otp"\s*:/.test(joined), "an OTP appears in a send result");
+    });
+  }, logger);
+  expect(out.includes("MSG91 send failed"), "the failures were not logged at all (test is vacuous)");
+  expect(out.includes("******0099") && out.includes("******0013"), "staging did not log the masked phone");
+  for (const secret of [...STD_PHONES, MSG91_KEY, ...sentOtps]) expect(!out.includes(secret), "a phone number, OTP or the MSG91 key reached the staging log");
+  const rows = JSON.stringify(auditRows.slice(auditStart));
+  for (const secret of [MSG91_KEY, ...sentOtps]) expect(!rows.includes(secret), "an audit row contains an OTP or the key");
+  expect(auditRows.slice(auditStart).some((row) => row.provider === "msg91" && row.status === "SENT"), "audit rows were not written for standard-mode sends");
+});
+
+await test("M9", "provider resolver: standard mode returns the SAME MSG91 circuit breaker production uses (no recipient gate); look-alike configurations never reach MSG91", async () => {
+  const productionProvider = await withEnv({ NODE_ENV: "production", ...STD_MSG91 }, () => providers.resolveProvider());
+  const standard = await withEnv(STD_RUNTIME, () => providers.resolveProvider());
+  expect(standard === productionProvider && standard.inner && standard.inner.name === "msg91", "standard mode is not the plain production MSG91 provider");
+  const lookAlikes = [
+    ["mode 'open'", { STAGING_SMS_OTP_MODE: "open", STAGING_TEST_LOGINS: undefined }],
+    ["mode 'standard'", { STAGING_SMS_OTP_MODE: "standard", STAGING_TEST_LOGINS: undefined }],
+    ["tester logins present", { STAGING_TEST_LOGINS: loginsValue() }],
+    ["allowlist phones without the mode", { STAGING_SMS_ALLOWED_PHONES: PHONE_L1 }],
+    ["provider MSG91 (case)", { SMS_PROVIDER: "MSG91" }],
+    ["provider ' msg91'", { SMS_PROVIDER: " msg91" }],
+  ];
+  for (const [label, over] of lookAlikes) {
+    await withEnv({ ...STD_RUNTIME, ...over }, () => withFetch(okSms, async (calls) => {
+      const r = await otpService.dispatchOtpSms({ phone: PHONE_U1, otp: "x", purpose: OTP_PURPOSE.LOGIN });
+      expect(r.provider === "none" && calls.length === 0, `${label}: reached a real provider`);
+    }));
+  }
+  // The other two modes keep their own resolution.
+  await withEnv({ ...SMS_RUNTIME }, () => withFetch(okSms, async (calls) => {
+    await otpService.dispatchOtpSms({ phone: PHONE_U1, otp: "x", purpose: OTP_PURPOSE.LOGIN });
+    expect(calls.length === 0, "allowlist mode now texts an unlisted phone");
+    const ok = await otpService.dispatchOtpSms({ phone: PHONE_L1, otp: "654321", purpose: OTP_PURPOSE.LOGIN });
+    expect(ok.provider === "msg91" && calls.length === 1, "allowlist mode no longer texts a listed phone");
+  }));
+  await withEnv({ NODE_ENV: "staging", STAGING_TEST_LOGINS: loginsValue(), SMS_PROVIDER: undefined, STAGING_SMS_OTP_MODE: undefined, STAGING_SMS_ALLOWED_PHONES: undefined }, () => withFetch(okSms, async (calls) => {
+    const r = await otpService.dispatchOtpSms({ phone: PHONE_L1, otp: "x", purpose: OTP_PURPOSE.LOGIN });
+    expect(r.provider === "none" && calls.length === 0, "tester-login mode now sends SMS");
+  }));
+});
+
+await test("M10", "PRODUCTION and DEVELOPMENT non-regression with msg91 configured: same provider, any phone texted, original attempt policy, OTP echo rules and verify behaviour untouched", async () => {
+  for (const nodeEnv of ["production", "development"]) {
+    await quiet(() => withEnv({ NODE_ENV: nodeEnv, ALLOW_FIXED_OTP: undefined, STAGING_TEST_LOGINS: undefined, STAGING_SMS_OTP_MODE: undefined, STAGING_SMS_ALLOWED_PHONES: undefined, ...STD_MSG91 }, () =>
+      withFetch(okSms, async (calls) => {
+        expect(guards.isStagingStandardSmsMode() === false && guards.isStagingEnv() === false, `${nodeEnv}: treated as staging`);
+        const redis = makeFakeRedis();
+        const r = await sendVia(redis, PHONE_U1);
+        expect(r.success === true && r.provider === "msg91" && calls.length === 1 && mobileFromCall(calls[0]) === `91${PHONE_U1}`, `${nodeEnv}: send changed`);
+        const otp = otpFromCall(calls[0]);
+        expect(/^\d{6}$/.test(otp) && otp !== "123456" && !("otp" in r), `${nodeEnv}: OTP generation / echo changed`);
+        expect((await verifyVia(redis, PHONE_U1, WRONG_OTP === otp ? "654323" : WRONG_OTP)).code === "INVALID_OTP", `${nodeEnv}: wrong OTP result changed`);
+        expect(redis.evalCalls[0].args[1] === "5" && redis.evalCalls[0].args[2] === "300", `${nodeEnv}: the original 5 / 300 s attempt policy changed`);
+        expect((await verifyVia(redis, PHONE_U1, otp)).ok === true, `${nodeEnv}: a correct OTP no longer verifies`);
+      })));
+  }
+  // Development with the legacy flag still echoes the fixed OTP exactly as before; staging standard mode never does.
+  const devRes = await quiet(() => withEnv({ NODE_ENV: "development", ALLOW_FIXED_OTP: "true", SMS_PROVIDER: undefined, STAGING_TEST_LOGINS: undefined }, () => sendVia(makeFakeRedis(), PHONE_U1)));
+  expect(devRes.otp === "123456", "development fixed-OTP echo changed");
+  const stdRes = await withEnv({ ...STD_RUNTIME, ALLOW_FIXED_OTP: "true" }, () => withFetch(okSms, () => sendVia(makeFakeRedis(), PHONE_U1)));
+  expect(!("otp" in stdRes), "staging standard mode echoed an OTP");
+  // The routes (rate limiters), models and controllers are not part of this change.
+  const routes = fs.readFileSync(path.join(BACKEND_DIR, "routes/auth.routes.js"), "utf8");
+  for (const needle of ['"/partner/send-otp", partnerOtpLimiter', '"/partner/verify-otp", partnerVerifyLimiter', '"/user/send-otp", userOtpLimiter', '"/user/verify-otp", userVerifyLimiter']) {
+    expect(routes.includes(needle), `route rate limiter missing: ${needle}`);
+  }
+});
+
 await new Promise((resolve) => io.close(() => resolve()));
 await new Promise((resolve) => server.close(() => resolve()));
 
