@@ -29,8 +29,8 @@
  * a branch other than develop and left on Render's default NODE_ENV=production. From inside the
  * process that is otherwise indistinguishable from a production hotfix deploy, so the only
  * reliable evidence is what the operator configured: the variables below exist ONLY to configure
- * staging (the guard itself reads them in utils/stagingGuards.js) and have no meaning on
- * production. A process that carries one is a staging process, and must run as staging. Only the
+ * staging (utils/stagingGuards.js and the job allow-list in utils/stagingJobAllowlist.js read them) and
+ * have no meaning on production. A process that carries one is a staging process, and must run as staging. Only the
  * variable NAMES are ever reported, never values. Operational consequence: production must not
  * carry any of them (it should not — they hold the deny-list of production's own endpoints and the
  * staging test logins).
@@ -54,8 +54,8 @@
 export const STAGING_SERVICE_NAMES = Object.freeze(["barber-engine-v1"]);
 export const PRODUCTION_SERVICE_NAMES = Object.freeze(["zemish-production-api"]);
 
-// The environment variables that only ever configure staging (all are read in utils/stagingGuards.js;
-// a test keeps this list equal to the guard's actual reads).
+// The environment variables that only ever configure staging (read in utils/stagingGuards.js, and
+// STAGING_ENABLED_JOBS in utils/stagingJobAllowlist.js; a test keeps this list equal to the actual reads).
 export const STAGING_MARKER_VARIABLES = Object.freeze([
   "STAGING_TEST_LOGINS",
   "STAGING_FORBIDDEN_MONGO_ENDPOINTS",
@@ -63,6 +63,7 @@ export const STAGING_MARKER_VARIABLES = Object.freeze([
   "STAGING_ACK_SHARED_DEV_DATABASE",
   "STAGING_SMS_OTP_MODE",
   "STAGING_SMS_ALLOWED_PHONES",
+  "STAGING_ENABLED_JOBS",
 ]);
 
 export const STAGING_BRANCH = "develop";

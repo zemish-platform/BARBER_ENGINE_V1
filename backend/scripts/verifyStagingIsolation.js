@@ -50,7 +50,7 @@ import {
   STAGING_SMS_MODE_VAR,
 } from "../utils/stagingGuards.js";
 import { assertEnvironmentIdentity, STAGING_MARKER_VARIABLES } from "../utils/environmentIdentity.js";
-import { REGISTERED_JOB_NAMES } from "../utils/stagingJobAllowlist.js";
+import { REGISTERED_JOB_NAMES, STAGING_ENABLED_JOBS_VAR } from "../utils/stagingJobAllowlist.js";
 import {
   endpointFingerprint,
   mongoEndpointIdentity,
@@ -275,7 +275,7 @@ await test("I5", "boot entry (real stagingBootGuard.js, child process): develop 
 });
 
 // ─── Staging-only variables as an explicit staging identity (R-ID-6) ───────
-const markerValue = (name) => (name === "STAGING_TEST_LOGINS" ? SAFE_LOGINS : name === "STAGING_ACK_SHARED_DEV_DATABASE" ? STAGING_SHARED_DEV_DB_NAME : FP_PROD_MONGO);
+const markerValue = (name) => (name === "STAGING_TEST_LOGINS" ? SAFE_LOGINS : name === "STAGING_ACK_SHARED_DEV_DATABASE" ? STAGING_SHARED_DEV_DB_NAME : name === "STAGING_ENABLED_JOBS" ? "holdExpiry,reminder" : FP_PROD_MONGO);
 const withMarkers = (names) => Object.fromEntries(names.map((n) => [n, markerValue(n)]));
 
 await test("I6", "explicit staging identity (staging-only variables) must run as NODE_ENV=staging whatever the service name or branch; every other identity scenario is unchanged", async () => {
@@ -336,6 +336,7 @@ await test("I7", "marker list cannot drift: it equals the staging-only variables
   read.add(STAGING_SHARED_DEV_ACK_VAR); // read through a named constant, not `env.STAGING_*`
   read.add(STAGING_SMS_MODE_VAR);
   read.add(STAGING_SMS_ALLOWED_PHONES_VAR);
+  read.add(STAGING_ENABLED_JOBS_VAR); // read in utils/stagingJobAllowlist.js (via the boot guard), not via `env.STAGING_*` in stagingGuards.js
   expect(JSON.stringify([...read].sort()) === JSON.stringify([...STAGING_MARKER_VARIABLES].sort()), `marker list differs from the guard's reads: guard=${[...read].sort()} markers=${[...STAGING_MARKER_VARIABLES].sort()}`);
 
   const entry = pathToFileURL(path.join(BACKEND_DIR, "config/stagingBootGuard.js")).href;
@@ -358,6 +359,50 @@ await test("I7", "marker list cannot drift: it equals the staging-only variables
   // Pre-existing rule (PR #8), untouched: off Render, production mode + STAGING_TEST_LOGINS is still refused with its own message.
   const legacy = run({ NODE_ENV: "production", ...withMarkers(["STAGING_TEST_LOGINS"]) });
   expect(legacy.status === 1 && /STAGING_TEST_LOGINS must not be set when NODE_ENV=production/.test(legacy.stderr), "the pre-existing production rule changed");
+});
+
+await test("I8", "STAGING_ENABLED_JOBS is a production-forbidden staging variable: a Render production service carrying it is REFUSED (real boot guard); production without staging variables is unchanged; valid staging is still accepted", async () => {
+  expect(STAGING_MARKER_VARIABLES.includes(STAGING_ENABLED_JOBS_VAR), "STAGING_ENABLED_JOBS is not in the staging-only marker list");
+  const entry = pathToFileURL(path.join(BACKEND_DIR, "config/stagingBootGuard.js")).href;
+  const run = (env) => spawnSync(process.execPath, ["--input-type=module", "-e", `await import(${JSON.stringify(entry)})`], { cwd: os.tmpdir(), env: { PATH: process.env.PATH, ...env }, encoding: "utf8", timeout: 15000 });
+  const RENDER_PROD = { RENDER: "true", RENDER_SERVICE_NAME: "zemish-production-api", RENDER_GIT_BRANCH: "main", NODE_ENV: "production" };
+  const RENDER_STAGING = { RENDER: "true", RENDER_SERVICE_NAME: "BARBER_ENGINE_V1", RENDER_GIT_BRANCH: "develop" };
+
+  // (1) REFUSED — the exact production service, with only this variable added; the value is irrelevant (valid, invalid, full list).
+  for (const value of ["holdExpiry", REGISTERED_JOB_NAMES.join(","), "notAJob,,Reminder", SAFE_LOGINS]) {
+    const r = run({ ...RENDER_PROD, [STAGING_ENABLED_JOBS_VAR]: value });
+    expect(r.status === 1 && /Refusing to start/.test(r.stderr) && r.stderr.includes(STAGING_ENABLED_JOBS_VAR), `production + STAGING_ENABLED_JOBS was not refused (exit ${r.status})`);
+    expect(r.stdout.trim() === "" && !`${r.stdout}${r.stderr}`.includes(value) && !/MONGODB|REDIS|connect/i.test(r.stderr.replace(/STAGING_[A-Z_]+/g, "")), "the refusal printed a value or mentioned a connection");
+    noLeak(`${r.stdout}${r.stderr}`, "production refusal output");
+  }
+  // The identity rule itself: one violation naming the variable (never its value); the contradictory combination too.
+  const v = assertEnvironmentIdentity({ ...RENDER_PROD, [STAGING_ENABLED_JOBS_VAR]: "holdExpiry,reminder" });
+  expect(v.length === 1 && v[0].includes(STAGING_ENABLED_JOBS_VAR) && !v[0].includes("holdExpiry"), `unexpected identity result: ${JSON.stringify(v)}`);
+  for (const over of [{ RENDER_SERVICE_NAME: "renamed-service", RENDER_GIT_BRANCH: "feature/x" }, { RENDER_SERVICE_NAME: undefined, RENDER_GIT_BRANCH: undefined }, { RENDER_GIT_BRANCH: "develop" }]) {
+    const env = { ...RENDER_PROD, ...over, [STAGING_ENABLED_JOBS_VAR]: "reminder" };
+    for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
+    expect(assertEnvironmentIdentity(env).some((m) => m.includes(STAGING_ENABLED_JOBS_VAR)), `renamed / unlabelled / develop service carrying the variable was not refused: ${JSON.stringify(over)}`);
+  }
+
+  // (2) UNCHANGED — normal production without any staging-only variable, and a blank value (blank is not a staging identity).
+  for (const extra of [{}, { [STAGING_ENABLED_JOBS_VAR]: "" }, { [STAGING_ENABLED_JOBS_VAR]: "   " }]) {
+    const r = run({ ...RENDER_PROD, ...extra });
+    expect(r.status === 0 && `${r.stdout}${r.stderr}`.trim() === "", `normal production changed (exit ${r.status}): ${r.stderr.slice(0, 160)}`);
+  }
+  expect(assertEnvironmentIdentity(RENDER_PROD).length === 0, "normal production reports identity violations");
+  // Off Render (local development / CI / test) the variable is simply ignored — exactly as before.
+  for (const env of [{ NODE_ENV: "production" }, { NODE_ENV: "development" }, { NODE_ENV: "test" }, {}]) {
+    const r = run({ ...env, [STAGING_ENABLED_JOBS_VAR]: "holdExpiry" });
+    expect(r.status === 0 && `${r.stdout}${r.stderr}`.trim() === "", `off-Render ${JSON.stringify(env)}: the variable changed behaviour (exit ${r.status})`);
+  }
+
+  // (3) ACCEPTED — a valid staging configuration, with the job list unset, partial, or full.
+  for (const list of [undefined, "", "holdExpiry", "reminder, otpAuditOutbox", REGISTERED_JOB_NAMES.join(",")]) {
+    const env = safeEnv({ ...RENDER_STAGING, ...(list === undefined ? {} : { [STAGING_ENABLED_JOBS_VAR]: list }) });
+    const r = run(env);
+    expect(r.status === 0 && `${r.stdout}${r.stderr}`.trim() === "", `valid staging with list '${list}' was refused (exit ${r.status}): ${r.stderr.slice(0, 200)}`);
+  }
+  expect(assertEnvironmentIdentity({ ...RENDER_STAGING, NODE_ENV: "staging", [STAGING_ENABLED_JOBS_VAR]: "holdExpiry" }).length === 0, "a correct staging service carrying the variable reports identity violations");
 });
 
 // ═══ M — MongoDB URI parsing: the driver is the authority ═════════════════
