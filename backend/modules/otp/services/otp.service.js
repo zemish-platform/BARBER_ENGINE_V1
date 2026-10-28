@@ -66,6 +66,7 @@ import {
   isStagingEnv,
   isStagingPermittedPhone,
   isStagingSmsPhoneAllowed,
+  isStagingStandardSmsMode,
   stagingTestOtpFor,
   stagingUnusableOtp,
   STAGING_OTP_ATTEMPT_LIMIT,
@@ -91,15 +92,16 @@ const ALLOW_FIXED_OTP = () => process.env.ALLOW_FIXED_OTP === "true";
 // ─── PURE PRIMITIVES ────────────────────────────────────────────────
 
 // STAGING (NODE_ENV=staging only — see utils/stagingGuards.js): never the legacy
-// fixed code. In SMS allowlist mode a phone on STAGING_SMS_ALLOWED_PHONES gets a
-// normal random OTP (the provider only ever sends to such phones — see
-// providers/index.js). Otherwise a phone listed in STAGING_TEST_LOGINS gets its own
+// fixed code. In the standard SMS mode (SMS_PROVIDER=msg91 and no tester logins /
+// allowlist — see utils/stagingGuards.js) every phone gets a normal random OTP. In SMS
+// allowlist mode a phone on STAGING_SMS_ALLOWED_PHONES gets a normal random OTP (the
+// provider only ever sends to such phones — see providers/index.js). Otherwise a phone listed in STAGING_TEST_LOGINS gets its own
 // secret OTP; any other phone (or no phone at all) gets an unusable non-numeric
 // token that is hashed like a real OTP and delivered nowhere. Every other
 // environment is unchanged — `phone` is ignored.
 export const generateOtp = ({ phone } = {}) => {
   if (isStagingEnv()) {
-    if (isStagingSmsPhoneAllowed(phone)) return crypto.randomInt(100000, 999999).toString();
+    if (isStagingStandardSmsMode() || isStagingSmsPhoneAllowed(phone)) return crypto.randomInt(100000, 999999).toString();
     return stagingTestOtpFor(phone) ?? stagingUnusableOtp();
   }
   if (ALLOW_FIXED_OTP()) return DEV_FIXED_OTP;
@@ -426,7 +428,7 @@ export const verifyOtp = async ({ phone, purpose, otp, role = null, req = null, 
 
   const { ip, userAgent, deviceId } = extractRequestContext(req);
 
-  // STAGING VETO — only permitted phones (STAGING_TEST_LOGINS, or the SMS allowlist) can ever succeed.
+  // STAGING VETO — only permitted phones (STAGING_TEST_LOGINS, the SMS allowlist, or any phone in the standard SMS mode) can ever succeed.
   // Applied AFTER the script so attempt counting, lockouts and audit rows are
   // identical for listed and unlisted phones. Even if a stored hash happened to
   // match (e.g. a Redis shared with a fixed-OTP dev instance), an unlisted phone

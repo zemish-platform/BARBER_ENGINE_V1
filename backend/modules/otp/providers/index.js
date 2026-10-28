@@ -33,7 +33,7 @@ import { Msg91Provider } from "./Msg91Provider.js";
 import { TwilioProvider } from "./TwilioProvider.js";
 import { AwsSnsProvider } from "./AwsSnsProvider.js";
 import { CircuitBreaker } from "./CircuitBreaker.js";
-import { canonicalPhone, getStagingSmsMode, isStagingEnv, isStagingSmsPhoneAllowed } from "../../../utils/stagingGuards.js";
+import { canonicalPhone, getStagingSmsMode, isStagingEnv, isStagingSmsPhoneAllowed, isStagingStandardSmsMode } from "../../../utils/stagingGuards.js";
 
 const devLogProvider = new DevLogProvider();
 const msg91CircuitBreaker = new CircuitBreaker(new Msg91Provider());
@@ -107,6 +107,10 @@ export const resolveProvider = () => {
 
   // Production and local development: exactly the original behaviour.
   if (!isStagingEnv()) return resolveBaseProvider(providerName);
+
+  // Staging STANDARD mode (SMS_PROVIDER=msg91 with no tester logins, SMS mode or allowlist — see
+  // utils/stagingGuards.js): the same provider, circuit breaker and delivery as outside staging; no recipient gate.
+  if (isStagingStandardSmsMode()) return resolveBaseProvider(providerName);
 
   // Staging WITHOUT the deliberate allowlist mode never reaches a real provider, whatever SMS_PROVIDER
   // says (the boot guard already refuses that combination; this is the second layer).
