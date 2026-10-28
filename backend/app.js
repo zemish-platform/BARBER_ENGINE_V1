@@ -104,7 +104,6 @@ import callWebhookRoutes from "./modules/support/routes/callWebhook.routes.js"; 
 import { protect } from "./middlewares/auth.middleware.js";
 import { requireRole } from "./middlewares/role.middleware.js"; // ← P0-4 — GET /health/ops admin gate, same pattern as every /api/admin/* route
 import { onboardingBypass } from "./middlewares/onboardingBypass.middleware.js";
-import { isStrictCorsEnv } from "./utils/stagingGuards.js"; // staging-only strict CORS (production already strict)
 import { errorHandler } from "./middlewares/errorHandler.js"; // ← NEW — Phase C: mounted globally, replaces the inline handler below
 import { getStatus as getJobHeartbeatStatus } from "./jobs/jobHeartbeat.js"; // ← P0-4 — background job monitoring, read-only
 
@@ -194,7 +193,7 @@ app.use(
   cors({
     origin: (origin, callback) => {
       if (!origin) return callback(null, true);
-      if (!isStrictCorsEnv()) return callback(null, true); // dev/test only — production AND staging are strict
+      if (process.env.NODE_ENV !== "production") return callback(null, true);
       if (allowedOrigins.includes(origin)) return callback(null, true);
       console.warn(`🚫 CORS blocked: ${origin}`);
       return callback(new Error("Not allowed by CORS"));
