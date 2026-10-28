@@ -12,8 +12,11 @@
  */
 
 import { assertStagingSafety } from "../utils/stagingGuards.js";
+import { assertStagingJobAllowlist } from "../utils/stagingJobAllowlist.js";
 
-const violations = assertStagingSafety(process.env);
+// The job allow-list is validated here too, so an invalid STAGING_ENABLED_JOBS stops the process before the app,
+// Redis or MongoDB are touched and before any background job can start (a no-op outside NODE_ENV=staging).
+const violations = [...assertStagingSafety(process.env), ...assertStagingJobAllowlist(process.env)];
 
 if (violations.length > 0) {
   console.error(

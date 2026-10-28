@@ -48,6 +48,7 @@ import {
   STAGING_SHARED_DEV_DB_NAME,
 } from "../utils/stagingGuards.js";
 import { assertEnvironmentIdentity, STAGING_MARKER_VARIABLES } from "../utils/environmentIdentity.js";
+import { REGISTERED_JOB_NAMES } from "../utils/stagingJobAllowlist.js";
 import {
   endpointFingerprint,
   mongoEndpointIdentity,
@@ -834,7 +835,10 @@ const runServer = async (env, { fakeMode = "plain", connectionName, connectionSt
   };
 };
 
-const serverStagingEnv = (over = {}) => ({ ...sharedDevEnv({ RENDER: "true", RENDER_SERVICE_NAME: "BARBER_ENGINE_V1", RENDER_GIT_BRANCH: "develop" }), ...over });
+// Staging starts NO background job unless STAGING_ENABLED_JOBS names it, so the scenarios that prove "jobs start only after the gate"
+// enable all of them explicitly (B5d proves the default, B5e an invalid list).
+const ALL_JOBS = REGISTERED_JOB_NAMES.join(",");
+const serverStagingEnv = (over = {}) => ({ ...sharedDevEnv({ RENDER: "true", RENDER_SERVICE_NAME: "BARBER_ENGINE_V1", RENDER_GIT_BRANCH: "develop", STAGING_ENABLED_JOBS: ALL_JOBS }), ...over });
 const jobsOrListenSeen = (r) => r.jobStarts > 0 || r.listening || r.listenLine >= 0 || r.openWhileRunning;
 
 await test("B1", "DEFENSE IN DEPTH — pre-flight passes but the connected user is privileged (root): process exits 1; NO job starts; server NEVER listens; port stays closed", async () => {
@@ -912,6 +916,34 @@ await test("B5b", "PRE-FLIGHT REFUSALS (post-connect layer would have passed): e
 await test("B5c", "a failing raw close() after a PASSING pre-flight does not block a correct staging boot (verdict unchanged)", async () => {
   const r = await runServer(serverStagingEnv(), { fakeMode: "ok", connectionName: DB, connectionStatus: scoped, preflight: { mode: "closefail" } });
   expect(r.preflightCloses === 1 && r.mongooseConnects === 1 && r.gateLine >= 0 && r.listening, `boot was blocked by a close failure (${r.diag})`);
+});
+
+await test("B5d", "STAGING default-deny: STAGING_ENABLED_JOBS unset (and blank) → ZERO background jobs start; the gate still passes and the API still listens", async () => {
+  for (const [label, over] of [["unset", { STAGING_ENABLED_JOBS: undefined }], ["blank", { STAGING_ENABLED_JOBS: "   " }]]) {
+    const env = serverStagingEnv(over); if (over.STAGING_ENABLED_JOBS === undefined) delete env.STAGING_ENABLED_JOBS;
+    const r = await runServer(env, { fakeMode: "ok", connectionName: DB, connectionStatus: scoped });
+    expect(r.gateLine >= 0 && r.listening, `${label}: the server did not come up API-only (${r.diag})`);
+    expect(r.jobStarts === 0 && r.firstJob === -1, `${label}: ${r.jobStarts} job(s) started although none was enabled`);
+    expect(/0 of 19 jobs enabled/.test(r.out) && !r.out.includes("Started"), `${label}: no default-deny confirmation, or a job reported starting`);
+    noLeak(`${r.out}${r.err}`, `${label} output`);
+  }
+});
+
+await test("B5e", "STAGING invalid STAGING_ENABLED_JOBS (unknown, wrong case, duplicate, empty entry, trailing comma): exits 1 at the BOOT GUARD — no output, no pre-flight, no mongoose.connect, no job, no listen", async () => {
+  for (const [label, value] of [
+    ["unknown name", "holdExpiry,notAJob"],
+    ["wrong case", "HoldExpiry"],
+    ["duplicate", "reminder,reminder"],
+    ["empty entry", "reminder,,autoStart"],
+    ["trailing comma", "reminder,"],
+    ["valid name followed by an invalid one", "holdExpiry,reminder,Reminder2"],
+  ]) {
+    const r = await runServer(serverStagingEnv({ STAGING_ENABLED_JOBS: value }), { fakeMode: "ok", connectionName: DB, connectionStatus: scoped });
+    expect(r.code === 1 && /Refusing to start/.test(r.err) && /STAGING_ENABLED_JOBS entry/.test(r.err), `${label}: not refused at boot (${r.diag})`);
+    expect(r.out.trim() === "" && r.preflightConnects === 0 && r.mongooseConnects === 0 && r.statusCalls === 0, `${label}: output, a connection attempt or the gate happened before the refusal`);
+    expect(r.jobStarts === 0 && !jobsOrListenSeen(r) && !r.portOpenAfter, `${label}: a job started or the server listened`);
+    noLeak(`${r.out}${r.err}`, `${label} output`);
+  }
 });
 
 await test("B6", "STAGING service running with NODE_ENV=production (the original failure): exits 1 at the boot guard before ANY application output", async () => {

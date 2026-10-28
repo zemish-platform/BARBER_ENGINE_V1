@@ -65,6 +65,11 @@ jobs:
       - name: Staging isolation hardening (behavioural; faked MongoDB layer, loopback only)
         run: node scripts/verifyStagingIsolation.js
 
+      # Behavioural, hermetic: the staging-only background-job allow-list (default-deny). Stub start functions and
+      # static inspection of server.js only; never starts the backend or a real job, no database, no network.
+      - name: Staging job allow-list (behavioural; stub jobs only)
+        run: node scripts/verifyStagingJobAllowlist.js
+
       - name: App import smoke test (no database, no Redis, no network connections)
         env:
           NODE_ENV: test
