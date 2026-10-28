@@ -57,6 +57,7 @@ const rnd = (bytes) => crypto.randomBytes(bytes).toString("hex");
 const SCRUBBED_NAMES = [
   "REDIS_URL", "MONGODB_URI", "ZEMISH_DIAG_REDIS_URL", "ALLOW_FIXED_OTP", "RAZORPAY_ALLOW_TEST_BYPASS",
   "SMS_PROVIDER", "PUSH_PROVIDER", "STAGING_TEST_LOGINS", "RAZORPAY_WEBHOOK_SECRET", "CASHFREE_ENV",
+  "STAGING_SMS_OTP_MODE", "STAGING_SMS_ALLOWED_PHONES", "MSG91_AUTH_KEY", "MSG91_TEMPLATE_ID", "MSG91_SENDER_ID",
 ];
 // Remember what the process was LAUNCHED with (for the R0 scrubbed-env proof), then scrub.
 const LAUNCH_ENV_SEEN = Object.fromEntries(SCRUBBED_NAMES.map((n) => [n, process.env[n] !== undefined]));
@@ -1110,6 +1111,288 @@ await test("C5", "webhook (no Origin) is untouched by strict CORS: 503 when unco
       quiet(() => httpRequest({ method: "POST", path: "/api/webhooks/razorpay", headers: { "content-type": "application/json", "x-razorpay-signature": "bad" }, body: "{}" })));
     expect(badSig.status === 401, `${nodeEnv}: bad signature returned ${badSig.status}`);
   }
+});
+
+
+// ─── S — staging SMS OTP, allowlist mode (real OTP service + real MSG91 provider; fetch is STUBBED) ───────────────
+section("S  staging SMS OTP allowlist (real MSG91 provider code; global fetch stubbed — no network, no real SMS)");
+
+const guards = await import("../utils/stagingGuards.js");
+const providers = await import("../modules/otp/providers/index.js");
+const MSG91_KEY = `key${rnd(8)}`;
+ALL_SENTINELS.push(MSG91_KEY);
+const SMS_ALLOWED = [PHONE_L1, PHONE_L2];
+// A complete SMS-mode staging configuration: no tester logins, MSG91 provider, an explicit recipient list.
+const smsVars = (over = {}) => ({
+  STAGING_SMS_OTP_MODE: "allowlist", STAGING_SMS_ALLOWED_PHONES: SMS_ALLOWED.join(","), SMS_PROVIDER: "msg91",
+  MSG91_AUTH_KEY: MSG91_KEY, MSG91_TEMPLATE_ID: `tpl${rnd(3)}`, MSG91_SENDER_ID: "ZEMSH1", ...over,
+});
+const smsGuardEnv = (over = {}) => { const e = { ...safeStagingEnv(), ...smsVars(), ...over }; delete e.STAGING_TEST_LOGINS; return { ...e, ...(over.STAGING_TEST_LOGINS ? { STAGING_TEST_LOGINS: over.STAGING_TEST_LOGINS } : {}) }; };
+const SMS_RUNTIME = { NODE_ENV: "staging", STAGING_TEST_LOGINS: undefined, ALLOW_FIXED_OTP: undefined, PUSH_PROVIDER: undefined, ...smsVars() };
+const withoutKey = (env, ...names) => { const e = { ...env }; for (const n of names) delete e[n]; return e; };
+
+// Replaces global fetch for the duration of fn; records every call; NEVER reaches the network.
+const withFetch = async (impl, fn) => {
+  const saved = globalThis.fetch; const calls = [];
+  globalThis.fetch = async (url, init) => { calls.push({ url: String(url), headers: init?.headers }); return impl(String(url)); };
+  try { return await fn(calls); } finally { globalThis.fetch = saved; }
+};
+const okSms = async () => ({ ok: true, status: 200, json: async () => ({ type: "success", request_id: `req-${rnd(3)}` }) });
+const failSms = async () => ({ ok: false, status: 400, json: async () => ({ type: "error", message: "synthetic provider rejection" }) });
+const throwSms = async () => { throw new Error("synthetic network failure"); };
+const otpFromCall = (call) => new URL(call.url).searchParams.get("otp");
+const mobileFromCall = (call) => new URL(call.url).searchParams.get("mobile");
+
+await test("S1", "boot guard: allowlist mode accepts a complete config; refuses every ambiguous, partial or unsupported one (fixed OTP stays off)", async () => {
+  expect(assertStagingSafety(smsGuardEnv()).length === 0, `a complete allowlist config was refused: ${assertStagingSafety(smsGuardEnv()).join(" | ")}`);
+  expect(assertStagingSafety(smsGuardEnv({ STAGING_SMS_ALLOWED_PHONES: `${PHONE_L1}, ${PHONE_L2}` })).length === 0, "a space after the comma should be tolerated (entries are trimmed)");
+  const twentyFive = Array.from({ length: 25 }, (_, i) => `600000${String(1000 + i)}`).join(",");
+  expect(assertStagingSafety(smsGuardEnv({ STAGING_SMS_ALLOWED_PHONES: twentyFive })).length === 0, "25 phones should be accepted");
+  const base = smsGuardEnv();
+  const bad = [
+    ["STAGING_TEST_LOGINS also set (ambiguous)", smsGuardEnv({ STAGING_TEST_LOGINS: loginsValue() }), /STAGING_TEST_LOGINS must be unset/],
+    ["mode 'open' (not supported)", smsGuardEnv({ STAGING_SMS_OTP_MODE: "open" }), /unset or exactly "allowlist"/],
+    ["mode 'Allowlist' (case)", smsGuardEnv({ STAGING_SMS_OTP_MODE: "Allowlist" }), /unset or exactly "allowlist"/],
+    ["mode ' allowlist' (whitespace)", smsGuardEnv({ STAGING_SMS_OTP_MODE: " allowlist" }), /unset or exactly "allowlist"/],
+    ["mode 'true'", smsGuardEnv({ STAGING_SMS_OTP_MODE: "true" }), /unset or exactly "allowlist"/],
+    ["allowlist missing", withoutKey(base, "STAGING_SMS_ALLOWED_PHONES"), /STAGING_SMS_ALLOWED_PHONES is not set/],
+    ["allowlist blank", smsGuardEnv({ STAGING_SMS_ALLOWED_PHONES: "   " }), /STAGING_SMS_ALLOWED_PHONES is not set/],
+    ["phone with +91", smsGuardEnv({ STAGING_SMS_ALLOWED_PHONES: `+91${PHONE_L1}` }), /entry 1: phone must be 10 digits/],
+    ["phone too short", smsGuardEnv({ STAGING_SMS_ALLOWED_PHONES: "60000" }), /entry 1: phone must be 10 digits/],
+    ["phone starting 1", smsGuardEnv({ STAGING_SMS_ALLOWED_PHONES: "1000000011" }), /entry 1: phone must be 10 digits/],
+    ["trailing comma", smsGuardEnv({ STAGING_SMS_ALLOWED_PHONES: `${PHONE_L1},` }), /entry 2: empty entry/],
+    ["duplicate phone", smsGuardEnv({ STAGING_SMS_ALLOWED_PHONES: `${PHONE_L1},${PHONE_L1}` }), /entry 2: duplicate phone/],
+    ["26 phones", smsGuardEnv({ STAGING_SMS_ALLOWED_PHONES: `${twentyFive},6000009999` }), /more than 25 entries/],
+    ["allowlist set but mode unset", withoutKey(base, "STAGING_SMS_OTP_MODE"), /is set but STAGING_SMS_OTP_MODE is not "allowlist"/],
+    ["SMS_PROVIDER missing", withoutKey(base, "SMS_PROVIDER"), /SMS_PROVIDER must be exactly "msg91"/],
+    ["SMS_PROVIDER none", smsGuardEnv({ SMS_PROVIDER: "none" }), /SMS_PROVIDER must be exactly "msg91"/],
+    ["SMS_PROVIDER MSG91 (case)", smsGuardEnv({ SMS_PROVIDER: "MSG91" }), /SMS_PROVIDER must be exactly "msg91"/],
+    ["SMS_PROVIDER twilio", smsGuardEnv({ SMS_PROVIDER: "twilio" }), /SMS_PROVIDER must be exactly "msg91"/],
+    ["SMS_PROVIDER aws_sns", smsGuardEnv({ SMS_PROVIDER: "aws_sns" }), /SMS_PROVIDER must be exactly "msg91"/],
+    ["MSG91_AUTH_KEY missing", withoutKey(base, "MSG91_AUTH_KEY"), /MSG91_AUTH_KEY must be set/],
+    ["MSG91_TEMPLATE_ID missing", withoutKey(base, "MSG91_TEMPLATE_ID"), /MSG91_TEMPLATE_ID must be set/],
+    ["MSG91_SENDER_ID blank", smsGuardEnv({ MSG91_SENDER_ID: " " }), /MSG91_SENDER_ID must be set/],
+    ["TWILIO_* set", smsGuardEnv({ TWILIO_ACCOUNT_SID: `AC${rnd(4)}` }), /TWILIO_\* variables must be unset/],
+    ["ALLOW_FIXED_OTP=true", smsGuardEnv({ ALLOW_FIXED_OTP: "true" }), /ALLOW_FIXED_OTP must be unset or false/],
+    ["SUREPASS_TOKEN set", smsGuardEnv({ SUREPASS_TOKEN: rnd(6) }), /SUREPASS_TOKEN must be unset/],
+  ];
+  for (const [label, env, pattern] of bad) {
+    const v = assertStagingSafety(env);
+    expect(v.some((m) => pattern.test(m)), `${label}: expected ${pattern}, got ${JSON.stringify(v)}`);
+    const text = v.join("\n");
+    expect(ALL_SENTINELS.every((x) => !text.includes(x)), `${label}: a phone / key / secret appears in a violation message`);
+  }
+  // Mode OFF keeps the original rules exactly.
+  expect(assertStagingSafety({ ...safeStagingEnv(), SMS_PROVIDER: "msg91" }).some((m) => /SMS_PROVIDER must be unset or "none"/.test(m)), "mode off: SMS_PROVIDER=msg91 was not refused");
+  expect(assertStagingSafety({ ...safeStagingEnv(), MSG91_AUTH_KEY: MSG91_KEY }).some((m) => /MSG91_\* variables must be unset/.test(m)), "mode off: MSG91_* was not refused");
+  expect(assertStagingSafety(withoutKey(safeStagingEnv(), "STAGING_TEST_LOGINS")).some((m) => /STAGING_TEST_LOGINS is not set/.test(m)), "mode off: missing tester logins was not refused");
+  expect(assertStagingSafety(safeStagingEnv()).length === 0, "the original tester-login configuration changed");
+  // Production / development: the new variables are inert.
+  expect(assertStagingSafety({ NODE_ENV: "production", ...smsVars() }).length === 0, "production is affected by the staging SMS variables");
+  expect(assertStagingSafety({ NODE_ENV: "development", ...smsVars() }).length === 0, "development is affected by the staging SMS variables");
+});
+
+await test("S2", "helpers: the allowlist matches canonical phones only in allowlist mode; tester logins are switched off in SMS mode", async () => {
+  const on = { ...smsVars(), STAGING_TEST_LOGINS: loginsValue() }; // deliberately ambiguous: runtime must still ignore fixed OTPs
+  expect(guards.getStagingSmsMode(on) === "allowlist", "mode not detected");
+  for (const bad of ["open", "Allowlist", " allowlist", "", undefined]) expect(guards.getStagingSmsMode({ STAGING_SMS_OTP_MODE: bad }) === null, `mode '${bad}' counted as on`);
+  for (const phone of [PHONE_L1, `+91${PHONE_L1}`, `+91 ${PHONE_L1}`, `91${PHONE_L1}`, `${PHONE_L2}`]) expect(guards.isStagingSmsPhoneAllowed(phone, on) === true, "an allowlisted phone form was rejected");
+  for (const phone of [PHONE_U1, PHONE_L3, "not-a-phone", "", undefined, null, 123, "60000000"]) expect(guards.isStagingSmsPhoneAllowed(phone, on) === false, `'${phone}' was allowed`);
+  expect(guards.isStagingSmsPhoneAllowed(PHONE_L1, { ...on, STAGING_SMS_OTP_MODE: undefined }) === false, "allowlist honoured while the mode is off");
+  expect(guards.getStagingTestLogins(on).size === 0 && guards.stagingTestOtpFor(PHONE_L1, on) === null, "tester logins stayed active in SMS mode");
+  expect(guards.isStagingPermittedPhone(PHONE_L1, on) && !guards.isStagingPermittedPhone(PHONE_U1, on) && !guards.isStagingPermittedPhone(PHONE_L3, on), "permitted-phone logic wrong in SMS mode");
+  const off = { STAGING_TEST_LOGINS: loginsValue() };
+  expect(guards.isStagingPermittedPhone(PHONE_L3, off) === true && guards.isStagingSmsPhoneAllowed(PHONE_L3, off) === false, "tester-login mode changed");
+});
+
+await test("S3", "generateOtp: allowed phone → a real random 6-digit OTP (never the fixed one); every other phone → the unusable token; fixed OTP never used; production/development unchanged", async () => {
+  const gen = (env, arg) => withEnv(env, () => otpService.generateOtp(arg));
+  const seen = new Set();
+  for (let i = 0; i < 40; i += 1) {
+    const v = await gen({ ...SMS_RUNTIME, ALLOW_FIXED_OTP: "true" }, { phone: i % 2 ? PHONE_L1 : `+91${PHONE_L2}` });
+    expect(/^\d{6}$/.test(v) && v !== "123456", "an allowed phone did not get a random 6-digit OTP");
+    seen.add(v);
+  }
+  expect(seen.size > 25, "OTPs are not random");
+  for (const arg of [undefined, {}, { phone: PHONE_U1 }, { phone: PHONE_L3 }, { phone: "not-a-phone" }]) {
+    const v = await gen({ ...SMS_RUNTIME, ALLOW_FIXED_OTP: "true" }, arg);
+    expect(!/^\d{4,6}$/.test(v) && v !== "123456", "an unlisted phone got a guessable code");
+  }
+  // Even if tester logins were also (wrongly) present, SMS mode never hands out a fixed tester OTP.
+  const withLogins = { ...SMS_RUNTIME, STAGING_TEST_LOGINS: loginsValue() };
+  expect(!/^\d{6}$/.test(await gen(withLogins, { phone: PHONE_L3 })), "a tester login still produced a fixed OTP in SMS mode");
+  expect(/^\d{6}$/.test(await gen({ NODE_ENV: "production", ALLOW_FIXED_OTP: undefined, ...smsVars() }, { phone: PHONE_U1 })), "production OTP changed");
+  expect((await gen({ NODE_ENV: "development", ALLOW_FIXED_OTP: "true", ...smsVars() }, { phone: PHONE_U1 })) === "123456", "development fixed OTP changed");
+  expect((await gen({ NODE_ENV: "staging", STAGING_TEST_LOGINS: loginsValue() }, { phone: PHONE_L2 })) === SECRETS.get(PHONE_L2), "tester-login mode changed");
+});
+
+await test("S4", "allowed phone: ONE MSG91 call with a normal random OTP; that OTP verifies; wrong OTPs fail; no OTP in the response; 30 s resend lock and 10-attempt lock still hold", async () => {
+  await withEnv(SMS_RUNTIME, () => withFetch(okSms, async (calls) => {
+    const redis = makeFakeRedis();
+    const r = await sendVia(redis, PHONE_L1);
+    expect(r.success === true && !("otp" in r), "send failed or echoed the otp");
+    expect(calls.length === 1, `expected exactly 1 provider call, got ${calls.length}`);
+    expect(mobileFromCall(calls[0]) === `91${PHONE_L1}`, "provider was called for a different number");
+    const otp = otpFromCall(calls[0]);
+    expect(/^\d{6}$/.test(otp) && otp !== "123456", "the SMS carried a non-random OTP");
+    expect(storedHash(redis, PHONE_L1) === sha256(otp), "stored hash is not the hash of the OTP that was sent");
+    const again = await sendVia(redis, PHONE_L1);
+    expect(again.success === false && again.code === "RESEND_TOO_SOON" && calls.length === 1, "the 30 s resend lock did not stop a second provider call");
+    const wrong = otp === WRONG_OTP ? "654323" : WRONG_OTP;
+    for (let i = 0; i < 10; i += 1) expect((await verifyVia(redis, PHONE_L1, wrong)).code === "INVALID_OTP", `wrong attempt ${i + 1}`);
+    expect((await verifyVia(redis, PHONE_L1, otp)).code === "TOO_MANY_ATTEMPTS", "attempt limit (10) no longer locks");
+    const redis2 = makeFakeRedis();
+    await sendVia(redis2, PHONE_L2);
+    const otp2 = otpFromCall(calls[1]);
+    expect((await verifyVia(redis2, PHONE_L2, otp2)).ok === true, "the SMS OTP did not verify");
+    expect((await verifyVia(redis2, PHONE_L2, otp2)).ok === false, "an OTP verified twice");
+  }));
+});
+
+await test("S5", "unlisted / invalid / missing phone: NO provider call at all (fetch never invoked), same success-shaped response, can never verify even against a matching hash", async () => {
+  await withEnv(SMS_RUNTIME, () => withFetch(okSms, async (calls) => {
+    const redisA = makeFakeRedis(); const redisU = makeFakeRedis();
+    const allowed = await sendVia(redisA, PHONE_L1);
+    const before = calls.length;
+    for (const phone of [PHONE_U1, PHONE_L3, "5000000000", "12345"]) {
+      const r = await sendVia(makeFakeRedis(), phone);
+      expect(r.success === true && !("otp" in r), `${phone}: not success-shaped`);
+      expect(JSON.stringify(Object.keys(r).sort()) === JSON.stringify(Object.keys(allowed).sort()), `${phone}: response shape reveals the allowlist`);
+    }
+    expect(calls.length === before, "an unlisted phone reached the SMS provider");
+    // The veto: even a stored hash that matches a code does not let an unlisted phone through.
+    redisU.store.set(keyFor("USER", "LOGIN", PHONE_U1, "hash"), { value: JSON.stringify({ hash: sha256("654321"), purpose: "LOGIN" }), exp: null });
+    expect((await verifyVia(redisU, PHONE_U1, "654321")).ok === false, "an unlisted phone verified against a matching hash");
+    const redisA2 = makeFakeRedis();
+    redisA2.store.set(keyFor("USER", "LOGIN", PHONE_L1, "hash"), { value: JSON.stringify({ hash: sha256("654321"), purpose: "LOGIN" }), exp: null });
+    expect((await verifyVia(redisA2, PHONE_L1, "654321")).ok === true, "an allowed phone could not verify");
+  }));
+});
+
+await test("S6", "provider failures for an ALLOWED phone: HTTP error and network error → SMS_SEND_FAILED, counted by the breaker; unlisted phones never reach or trip it; recovery resets it", async () => {
+  await withEnv(SMS_RUNTIME, async () => {
+    const stateOf = () => providers.getMsg91CircuitBreakerState().failureCount;
+    const base = stateOf();
+    await quiet(() => withFetch(failSms, async (calls) => {
+      const r = await sendVia(makeFakeRedis(), PHONE_L1);
+      expect(r.success === false && r.code === "SMS_SEND_FAILED" && calls.length === 1, "an HTTP error was not reported as SMS_SEND_FAILED");
+    }));
+    await quiet(() => withFetch(throwSms, async (calls) => {
+      const r = await sendVia(makeFakeRedis(), PHONE_L2);
+      expect(r.success === false && r.code === "SMS_SEND_FAILED" && calls.length === 1, "a network error was not reported as SMS_SEND_FAILED");
+    }));
+    expect(stateOf() === base + 2, "real failures were not counted by the circuit breaker");
+    await withFetch(okSms, async (calls) => {
+      for (let i = 0; i < 12; i += 1) await sendVia(makeFakeRedis(), i % 2 ? PHONE_U1 : PHONE_L3);
+      expect(calls.length === 0 && stateOf() === base + 2, "unlisted sends reached the provider or moved the breaker");
+      const ok = await sendVia(makeFakeRedis(), PHONE_L1);
+      expect(ok.success === true && calls.length === 1 && stateOf() === 0, "a successful send did not reset the breaker");
+    });
+  });
+});
+
+await test("S7", "logging privacy: staging never logs the phone, OTP or MSG91 key (success and failure paths); development logs exactly what it did before", async () => {
+  const out = await capture(async () => {
+    await withEnv(SMS_RUNTIME, async () => {
+      await withFetch(throwSms, async () => { await sendVia(makeFakeRedis(), PHONE_L1); });
+      await withFetch(failSms, async () => { await sendVia(makeFakeRedis(), PHONE_L2); });
+      await withFetch(okSms, async () => { await sendVia(makeFakeRedis(), PHONE_L1); await sendVia(makeFakeRedis(), PHONE_U1); });
+    });
+  }, logger);
+  expect(out.includes("MSG91 send failed"), "the failure was not logged at all (test is vacuous)");
+  for (const secret of [PHONE_L1, PHONE_L2, PHONE_U1, MSG91_KEY]) expect(!out.includes(secret), "staging logged a phone number or the MSG91 key");
+  expect(out.includes("******0011") || out.includes("******0012"), "staging did not log the masked phone");
+  // Regression: outside staging the phone is logged raw, as before.
+  const dev = await capture(async () => {
+    await withEnv({ NODE_ENV: "development", SMS_PROVIDER: "msg91", MSG91_AUTH_KEY: MSG91_KEY, MSG91_TEMPLATE_ID: "t", MSG91_SENDER_ID: "s" }, () =>
+      withFetch(throwSms, () => otpService.dispatchOtpSms({ phone: PHONE_L1, otp: "654321", purpose: OTP_PURPOSE.LOGIN })));
+  }, logger);
+  expect(dev.includes(PHONE_L1) && !dev.includes(MSG91_KEY), "development logging changed");
+});
+
+await test("S8", "no-show OTP call site (booking controller UNCHANGED): same two entry points, so an unapproved number gets no SMS; an approved number gets the generated OTP", async () => {
+  const source = fs.readFileSync(path.join(BACKEND_DIR, "controllers/booking.controller.js"), "utf8");
+  expect(/const otp\s*=\s*generateOtp\(\{ phone: booking\.userRef\.phone \}\)/.test(source), "the no-show OTP is no longer generated through generateOtp({ phone })");
+  expect(/await dispatchOtpSms\(\{\s*phone: booking\.userRef\.phone,/.test(source), "the no-show OTP is no longer sent through dispatchOtpSms");
+  expect(!/Msg91Provider|resolveProvider|SMS_PROVIDER|fetch\(/.test(source), "the booking controller talks to an SMS provider directly");
+  await withEnv(SMS_RUNTIME, () => withFetch(okSms, async (calls) => {
+    for (const phone of [PHONE_U1, PHONE_L3, "not-a-phone", undefined]) {
+      const otp = otpService.generateOtp({ phone });
+      const r = await otpService.dispatchOtpSms({ phone, otp, purpose: OTP_PURPOSE.BOOKING_NOSHOW });
+      expect(!/^\d{6}$/.test(otp), "an unapproved number got a numeric OTP");
+      expect(r.success === true && r.provider === "none", "an unapproved number did not get the staging no-op result");
+    }
+    expect(calls.length === 0, "the no-show path sent an SMS to an unapproved number");
+    const phone = `+91${PHONE_L1}`;
+    const otp = otpService.generateOtp({ phone });
+    const r = await otpService.dispatchOtpSms({ phone: PHONE_L1, otp, purpose: OTP_PURPOSE.BOOKING_NOSHOW });
+    expect(r.success === true && r.provider === "msg91" && calls.length === 1 && otpFromCall(calls[0]) === otp, "an approved number did not get exactly one SMS carrying the generated OTP");
+  }));
+});
+
+await test("S8b", "REGRESSION: an allowlisted number in +91 form reaches MSG91 as the normalized 10-digit number, and the full phone never appears in staging error logs", async () => {
+  const forms = [`+91${PHONE_L1}`, `+91 ${PHONE_L1}`, `91${PHONE_L1}`, PHONE_L1];
+  await withEnv(SMS_RUNTIME, async () => {
+    // Success path: every accepted form sends exactly once, to the normalized number (E.164 "91…" without "+").
+    await withFetch(okSms, async (calls) => {
+      for (const phone of forms) {
+        const before = calls.length;
+        const r = await otpService.dispatchOtpSms({ phone, otp: "654321", purpose: OTP_PURPOSE.BOOKING_NOSHOW });
+        expect(r.success === true && r.provider === "msg91", `'${phone}': the allowlisted number was not sent`);
+        expect(calls.length === before + 1 && mobileFromCall(calls[before]) === `91${PHONE_L1}`, `'${phone}': the provider did not receive the normalized number`);
+      }
+      // The protection is intact: the same prefixed forms of an UNLISTED number still never reach the provider.
+      const before = calls.length;
+      for (const phone of [`+91${PHONE_U1}`, `+91 ${PHONE_U1}`, `91${PHONE_U1}`]) {
+        const r = await otpService.dispatchOtpSms({ phone, otp: "654321", purpose: OTP_PURPOSE.BOOKING_NOSHOW });
+        expect(r.success === true && r.provider === "none", `'${phone}': unlisted prefixed number did not get the staging no-op`);
+      }
+      expect(calls.length === before, "an unlisted number in +91 form reached the provider");
+    });
+    // Failure paths: the number may be sent but MSG91 errors — nothing in the logs may carry the full phone, the OTP or the key.
+    const out = await capture(async () => {
+      await withFetch(failSms, async () => { await otpService.dispatchOtpSms({ phone: `+91${PHONE_L1}`, otp: "654321", purpose: OTP_PURPOSE.BOOKING_NOSHOW }); });
+      await withFetch(throwSms, async () => { await otpService.dispatchOtpSms({ phone: `+91 ${PHONE_L1}`, otp: "654321", purpose: OTP_PURPOSE.BOOKING_NOSHOW }); });
+    }, logger);
+    expect(out.includes("MSG91 send failed"), "the failure was not logged (test is vacuous)");
+    expect(!out.includes(PHONE_L1) && !out.includes("654321") && !out.includes(MSG91_KEY), "a full phone number, the OTP or the key reached the staging log");
+    expect(out.includes("******0011"), "the masked phone was not logged");
+    // Leave the breaker closed for the tests that follow.
+    await withFetch(okSms, () => otpService.dispatchOtpSms({ phone: PHONE_L1, otp: "654321", purpose: OTP_PURPOSE.BOOKING_NOSHOW }));
+  });
+});
+
+await test("S9", "provider resolver: staging without the mode never reaches a real provider; unsupported provider fails closed; audit rows carry no OTP", async () => {
+  // Boot guard would refuse these; this proves the second layer.
+  await withEnv({ NODE_ENV: "staging", STAGING_SMS_OTP_MODE: undefined, SMS_PROVIDER: "msg91", MSG91_AUTH_KEY: MSG91_KEY, MSG91_TEMPLATE_ID: "t", MSG91_SENDER_ID: "s", STAGING_TEST_LOGINS: loginsValue() }, () =>
+    withFetch(okSms, async (calls) => {
+      const r = await otpService.dispatchOtpSms({ phone: PHONE_L1, otp: "x", purpose: OTP_PURPOSE.LOGIN });
+      expect(r.success === true && r.provider === "none" && calls.length === 0, "staging without the mode reached MSG91");
+    }));
+  for (const name of ["twilio", "aws_sns", "unknown_x", undefined]) {
+    await quiet(() => withEnv({ ...SMS_RUNTIME, SMS_PROVIDER: name }, () => withFetch(okSms, async (calls) => {
+      const r = await otpService.dispatchOtpSms({ phone: PHONE_L1, otp: "x", purpose: OTP_PURPOSE.LOGIN });
+      expect(r.success === false && calls.length === 0, `provider '${name}' in allowlist mode did not fail closed`);
+    })));
+  }
+  const rows = JSON.stringify(auditRows);
+  expect(!rows.includes(MSG91_KEY), "an audit row contains the MSG91 key");
+});
+
+await test("S10", "PRODUCTION and DEVELOPMENT regression: the raw provider is returned (no recipient gate); any phone is texted exactly as before, even with staging SMS variables present", async () => {
+  for (const nodeEnv of ["production", "development"]) {
+    await quiet(() => withEnv({ NODE_ENV: nodeEnv, SMS_PROVIDER: "msg91", MSG91_AUTH_KEY: MSG91_KEY, MSG91_TEMPLATE_ID: "t", MSG91_SENDER_ID: "s", STAGING_SMS_OTP_MODE: "allowlist", STAGING_SMS_ALLOWED_PHONES: PHONE_L1 }, () =>
+      withFetch(okSms, async (calls) => {
+        const provider = providers.resolveProvider();
+        expect(provider.inner && provider.inner.name === "msg91", `${nodeEnv}: the provider is wrapped or not the circuit breaker`);
+        const r = await otpService.dispatchOtpSms({ phone: PHONE_U1, otp: "654321", purpose: OTP_PURPOSE.LOGIN });
+        expect(r.success === true && r.provider === "msg91" && calls.length === 1 && mobileFromCall(calls[0]) === `91${PHONE_U1}`, `${nodeEnv}: a phone outside the (inert) staging list was not texted`);
+      })));
+  }
+  await withEnv({ NODE_ENV: "production", SMS_PROVIDER: undefined }, async () => {
+    expect(providers.resolveProvider().name === "none", "production default provider changed");
+  });
+  expect(providers.resolveProvider !== undefined && typeof providers.getMsg91CircuitBreakerState === "function", "provider exports changed");
 });
 
 await new Promise((resolve) => io.close(() => resolve()));
