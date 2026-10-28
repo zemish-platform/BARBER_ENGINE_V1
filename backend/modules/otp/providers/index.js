@@ -33,7 +33,6 @@ import { Msg91Provider } from "./Msg91Provider.js";
 import { TwilioProvider } from "./TwilioProvider.js";
 import { AwsSnsProvider } from "./AwsSnsProvider.js";
 import { CircuitBreaker } from "./CircuitBreaker.js";
-import { canonicalPhone, getStagingSmsMode, isStagingEnv, isStagingSmsPhoneAllowed, isStagingStandardSmsMode } from "../../../utils/stagingGuards.js";
 
 const devLogProvider = new DevLogProvider();
 const msg91CircuitBreaker = new CircuitBreaker(new Msg91Provider());
@@ -67,7 +66,9 @@ const unknownProvider = (providerName) => ({
  * call (not cached at module-load) so tests can flip the env var
  * between cases without re-importing this module.
  */
-const resolveBaseProvider = (providerName) => {
+export const resolveProvider = () => {
+  const providerName = process.env.SMS_PROVIDER || "none";
+
   switch (providerName) {
     case "none":
       return devLogProvider;
@@ -80,45 +81,6 @@ const resolveBaseProvider = (providerName) => {
     default:
       return unknownProvider(providerName);
   }
-};
-
-/**
- * STAGING ONLY — recipient gate. Wraps the real provider so that a phone that is not on
- * STAGING_SMS_ALLOWED_PHONES never reaches it: no network call, no log, no circuit-breaker
- * count. The caller gets exactly what the staging no-op provider returns for any other phone
- * (a success-shaped result, provider "none"), so a response never reveals which numbers are
- * on the list. Every call re-reads the allowlist from the environment.
- */
-const stagingRecipientGate = (inner) => ({
-  get name() {
-    return inner.name;
-  },
-  ...(typeof inner.getState === "function" ? { getState: () => inner.getState() } : {}),
-  async sendOtp(phone, otp, context = {}) {
-    if (!isStagingSmsPhoneAllowed(phone)) return devLogProvider.sendOtp(phone, otp, context);
-    // The allowlist matched the CANONICAL phone, so hand the provider that same bare 10-digit number (a
-    // "+91…" form would be rejected by the provider, and its error text would carry the full number).
-    return inner.sendOtp(canonicalPhone(phone), otp, context);
-  },
-});
-
-export const resolveProvider = () => {
-  const providerName = process.env.SMS_PROVIDER || "none";
-
-  // Production and local development: exactly the original behaviour.
-  if (!isStagingEnv()) return resolveBaseProvider(providerName);
-
-  // Staging STANDARD mode (SMS_PROVIDER=msg91 with no tester logins, SMS mode or allowlist — see
-  // utils/stagingGuards.js): the same provider, circuit breaker and delivery as outside staging; no recipient gate.
-  if (isStagingStandardSmsMode()) return resolveBaseProvider(providerName);
-
-  // Staging WITHOUT the deliberate allowlist mode never reaches a real provider, whatever SMS_PROVIDER
-  // says (the boot guard already refuses that combination; this is the second layer).
-  if (!getStagingSmsMode()) return devLogProvider;
-
-  // Allowlist mode supports MSG91 only; anything else fails closed instead of silently not sending.
-  if (providerName !== "msg91") return unknownProvider(providerName);
-  return stagingRecipientGate(resolveBaseProvider(providerName));
 };
 
 /**

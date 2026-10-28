@@ -45,7 +45,6 @@
  */
 
 import logger from "../../../utils/logger.js";
-import { maskPhoneForLog } from "../../../utils/stagingGuards.js";
 import { OtpProvider } from "./OtpProvider.js";
 
 const SMS_TIMEOUT_MS = 5000;
@@ -89,7 +88,7 @@ export class Msg91Provider extends OtpProvider {
 
     if (!authKey || !templateId || !senderId) {
       logger.error("MSG91_AUTH_KEY / MSG91_TEMPLATE_ID / MSG91_SENDER_ID missing in env", {
-        phone: maskPhoneForLog(phone),
+        phone,
         missing: [
           !authKey && "MSG91_AUTH_KEY",
           !templateId && "MSG91_TEMPLATE_ID",
@@ -144,7 +143,7 @@ export class Msg91Provider extends OtpProvider {
         };
       }
 
-      logger.error("MSG91 send failed", { phone: maskPhoneForLog(phone), httpStatus: response.status, responseBody: data });
+      logger.error("MSG91 send failed", { phone, httpStatus: response.status, responseBody: data });
       return {
         success: false,
         provider: this.name,
@@ -153,7 +152,7 @@ export class Msg91Provider extends OtpProvider {
         error: data?.message || "SMS_SEND_FAILED",
       };
     } catch (err) {
-      logger.error("MSG91 send failed", { message: err.message, phone: maskPhoneForLog(phone) });
+      logger.error("MSG91 send failed", { message: err.message, phone });
       return {
         success: false,
         provider: this.name,

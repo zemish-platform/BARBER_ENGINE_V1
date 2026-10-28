@@ -1,5 +1,4 @@
 import "dotenv/config";
-import "./config/stagingBootGuard.js"; // must stay directly after dotenv and BEFORE app.js — see that file
 import http from "http";
 import mongoose from "mongoose"; // ← IMPROVEMENT-2: needed for DB close + health check
 import app from "./app.js";
@@ -25,9 +24,6 @@ import { startNotificationRetryJob } from "./modules/notifications/jobs/notifica
 import { startCashfreePayoutReconcileJob } from "./modules/fieldAgent/jobs/cashfreePayoutReconcile.job.js"; // ← FA-P4-D Step 1 — polls in-flight Cashfree Field Agent payouts whose webhook never arrived; idempotent, multi-instance safe
 import { startGenericPayoutReconcileJob } from "./modules/payout/jobs/genericPayoutReconcile.job.js"; // ← STEP 6.4 — polls in-flight RAZORPAY_ROUTE GenericPayoutRequest payouts whose webhook never arrived; idempotent, multi-instance safe; safe no-op when Razorpay Route isn't configured
 import { initSocket } from "./socket/index.js";
-import { isStagingEnv } from "./utils/stagingGuards.js";
-import { runStagingPreflight, runStagingStartupGate } from "./utils/stagingStartupGate.js";
-import { createJobStarter } from "./utils/stagingJobAllowlist.js";
 
 //////////////////////////////////////////////////////////////
 // 🔑 STEP 1: LOAD ENVIRONMENT VARIABLES
@@ -55,16 +51,7 @@ if (process.env.NODE_ENV === "production" && process.env.ALLOW_FIXED_OTP === "tr
 // 🔑 STEP 2: CONNECT DATABASE (MongoDB)
 //////////////////////////////////////////////////////////////
 
-// STAGING ONLY: verify the target and the credentials' scope with a raw, read-only driver client BEFORE
-// Mongoose connects. Once Mongoose connects it creates collections/indexes for every model (autoIndex),
-// which would otherwise happen before any post-connect check could reject the credentials.
-// Skipped entirely on production and local development (no await, no extra connection).
-if (isStagingEnv()) {
-  const stagingPreflight = await runStagingPreflight({ MongoClient: mongoose.mongo.MongoClient });
-  if (!stagingPreflight.ok) process.exit(1);
-}
-
-const dbConnected = connectDB(); // same call, same moment as before; the promise is only used by the staging gate below
+connectDB();
 
 //////////////////////////////////////////////////////////////
 // 🔑 STEP 3: REDIS LIFECYCLE LOGGING
@@ -116,42 +103,6 @@ try {
 app.set("io", io);
 
 //////////////////////////////////////////////////////////////
-// 🔒 STEP 7a: STAGING STARTUP GATE (staging only — skipped entirely elsewhere)
-//
-// Nothing below this line — no background job, no httpServer.listen() — runs
-// on staging until the live MongoDB connection has been verified: connected
-// database name + every effective privilege scoped to that one database
-// (see utils/stagingStartupGate.js). On any failure the process exits here.
-// On production and local development this block is not executed at all, so
-// their startup order and timing are unchanged.
-//////////////////////////////////////////////////////////////
-
-if (isStagingEnv()) {
-  const stagingGate = await runStagingStartupGate(dbConnected, { mongoose });
-  if (!stagingGate.ok) process.exit(1);
-}
-
-//////////////////////////////////////////////////////////////
-// 🔒 STEP 7a-2: BACKGROUND-JOB ALLOW-LIST (staging only — pass-through elsewhere)
-//
-// On staging NO background job starts unless it is named in STAGING_ENABLED_JOBS
-// (unset or blank = none). The list is validated here, in full, before ANY job is
-// started; an invalid list exits the process instead of starting a subset. (The boot
-// guard has already rejected an invalid list before MongoDB/Redis were touched.)
-// On production, development, test or an unset NODE_ENV every job starts exactly as
-// before: startJob(name, fn) simply calls fn().
-// See utils/stagingJobAllowlist.js.
-//////////////////////////////////////////////////////////////
-
-let startJob;
-try {
-  startJob = createJobStarter({ env: process.env });
-} catch (error) {
-  console.error(`❌ Refusing to start — ${error.message}`);
-  process.exit(1);
-}
-
-//////////////////////////////////////////////////////////////
 // 🚀 STEP 7b: START HOLD EXPIRY BACKGROUND JOB
 //
 // Started here (after initSocket) because the job needs the
@@ -160,7 +111,7 @@ try {
 // any downtime) then every 30 seconds on the interval.
 //////////////////////////////////////////////////////////////
 
-const holdExpiryJob = startJob("holdExpiry", () => startHoldExpiryJob(io));
+const holdExpiryJob = startHoldExpiryJob(io);
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7c: START CUSTOMER ARRIVAL BACKGROUND JOB
@@ -174,7 +125,7 @@ const holdExpiryJob = startJob("holdExpiry", () => startHoldExpiryJob(io));
 // Returns a { stop } controller used in graceful shutdown.
 //////////////////////////////////////////////////////////////
 
-const customerArrivalJob = startJob("customerArrival", () => startCustomerArrivalJob(io));
+const customerArrivalJob = startCustomerArrivalJob(io);
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7d: START SERVICE OVERDUE BACKGROUND JOB
@@ -186,7 +137,7 @@ const customerArrivalJob = startJob("customerArrival", () => startCustomerArriva
 // Returns a { stop } controller used in graceful shutdown.
 //////////////////////////////////////////////////////////////
 
-const serviceOverdueJob = startJob("serviceOverdue", () => startServiceOverdueJob(io));
+const serviceOverdueJob = startServiceOverdueJob(io);
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7e: START AUTO COMPLETE BACKGROUND JOB
@@ -200,7 +151,7 @@ const serviceOverdueJob = startJob("serviceOverdue", () => startServiceOverdueJo
 // Returns a { stop } controller used in graceful shutdown.
 //////////////////////////////////////////////////////////////
 
-const autoCompleteJob = startJob("autoComplete", () => startAutoCompleteJob(io));
+const autoCompleteJob = startAutoCompleteJob(io);
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7f: START REMINDER BACKGROUND JOB (Booking Engine V2 — Phase 6)
@@ -209,7 +160,7 @@ const autoCompleteJob = startJob("autoComplete", () => startAutoCompleteJob(io))
 // No io needed — notification only, no socket emit.
 //////////////////////////////////////////////////////////////
 
-const reminderJob = startJob("reminder", () => startReminderJob());
+const reminderJob = startReminderJob();
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7g: START AUTO START BACKGROUND JOB (Booking Engine V2 — Phase 6)
@@ -218,7 +169,7 @@ const reminderJob = startJob("reminder", () => startReminderJob());
 // arrives, if the owner forgot to tap "Start Service".
 //////////////////////////////////////////////////////////////
 
-const autoStartJob = startJob("autoStart", () => startAutoStartJob(io));
+const autoStartJob = startAutoStartJob(io);
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7h: START SLA SCANNER BACKGROUND JOB (Phase G Step 10)
@@ -235,7 +186,7 @@ const autoStartJob = startJob("autoStart", () => startAutoStartJob(io));
 // holdExpiryJob above.
 //////////////////////////////////////////////////////////////
 
-const slaScannerJob = startJob("slaScanner", () => startSlaScannerJob(io));
+const slaScannerJob = startSlaScannerJob(io);
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7i: START RATING OUTBOX CONSUMER (Rating & Review Engine
@@ -247,7 +198,7 @@ const slaScannerJob = startJob("slaScanner", () => startSlaScannerJob(io));
 // jobs/ratingOutbox.job.js). No io needed — no realtime emit.
 //////////////////////////////////////////////////////////////
 
-const ratingOutboxJob = startJob("ratingOutbox", () => startRatingOutboxJob());
+const ratingOutboxJob = startRatingOutboxJob();
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7j: START WEEKLY SCHEDULE MATERIALIZER (C4 Phase 2)
@@ -261,7 +212,7 @@ const ratingOutboxJob = startJob("ratingOutbox", () => startRatingOutboxJob());
 // every row it creates (see jobs/weeklyScheduleMaterializer.job.js).
 //////////////////////////////////////////////////////////////
 
-const weeklyScheduleMaterializerJob = startJob("weeklyScheduleMaterializer", () => startWeeklyScheduleMaterializerJob());
+const weeklyScheduleMaterializerJob = startWeeklyScheduleMaterializerJob();
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7j2: START BOOKING READINESS CHANGE JOB (R4 — approved pilot)
@@ -276,7 +227,7 @@ const weeklyScheduleMaterializerJob = startJob("weeklyScheduleMaterializer", () 
 // needed — no realtime emit.
 //////////////////////////////////////////////////////////////
 
-const bookingReadinessChangeJob = startJob("bookingReadinessChange", () => startBookingReadinessChangeJob());
+const bookingReadinessChangeJob = startBookingReadinessChangeJob();
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7k: START FIELD AGENT KYC SYNC (FA-3.2 Consistency Layer)
@@ -288,7 +239,7 @@ const bookingReadinessChangeJob = startJob("bookingReadinessChange", () => start
 // needed — no realtime emit. See modules/kyc/jobs/fieldAgentKycSync.job.js.
 //////////////////////////////////////////////////////////////
 
-const fieldAgentKycSyncJob = startJob("fieldAgentKycSync", () => startFieldAgentKycSyncJob());
+const fieldAgentKycSyncJob = startFieldAgentKycSyncJob();
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7l: START FRAUD DETECTION JOB (FA-7.2)
@@ -301,7 +252,7 @@ const fieldAgentKycSyncJob = startJob("fieldAgentKycSync", () => startFieldAgent
 // modules/fieldAgent/jobs/fraudDetection.job.js.
 //////////////////////////////////////////////////////////////
 
-const fraudDetectionJob = startJob("fraudDetection", () => startFraudDetectionJob());
+const fraudDetectionJob = startFraudDetectionJob();
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7m: START CROSS-AGENT OVERLAP JOB (FA-7.3)
@@ -314,7 +265,7 @@ const fraudDetectionJob = startJob("fraudDetection", () => startFraudDetectionJo
 // modules/fieldAgent/jobs/crossAgentOverlap.job.js for why.
 //////////////////////////////////////////////////////////////
 
-const crossAgentOverlapJob = startJob("crossAgentOverlap", () => startCrossAgentOverlapJob());
+const crossAgentOverlapJob = startCrossAgentOverlapJob();
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7n: START TERRITORY ASSIGNMENT OVERLAP JOB (FA-7.4)
@@ -328,7 +279,7 @@ const crossAgentOverlapJob = startJob("crossAgentOverlap", () => startCrossAgent
 // modules/fieldAgent/jobs/territoryAssignmentOverlap.job.js for why.
 //////////////////////////////////////////////////////////////
 
-const territoryAssignmentOverlapJob = startJob("territoryAssignmentOverlap", () => startTerritoryAssignmentOverlapJob());
+const territoryAssignmentOverlapJob = startTerritoryAssignmentOverlapJob();
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7o: START FIELD AGENT EARNING JOB (FA-9)
@@ -344,7 +295,7 @@ const territoryAssignmentOverlapJob = startJob("territoryAssignmentOverlap", () 
 // modules/fieldAgent/jobs/fieldAgentEarning.job.js.
 //////////////////////////////////////////////////////////////
 
-const fieldAgentEarningJob = startJob("fieldAgentEarning", () => startFieldAgentEarningJob());
+const fieldAgentEarningJob = startFieldAgentEarningJob();
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7p: START OTP AUDIT OUTBOX JOB (OTP-2 Part D)
@@ -356,7 +307,7 @@ const fieldAgentEarningJob = startJob("fieldAgentEarning", () => startFieldAgent
 // modules/otp/jobs/otpAuditOutbox.job.js.
 //////////////////////////////////////////////////////////////
 
-const otpAuditOutboxJob = startJob("otpAuditOutbox", () => startOtpAuditOutboxJob());
+const otpAuditOutboxJob = startOtpAuditOutboxJob();
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7q: START NOTIFICATION RETRY JOB (FA-P2-A)
@@ -368,15 +319,15 @@ const otpAuditOutboxJob = startJob("otpAuditOutbox", () => startOtpAuditOutboxJo
 // never retried again. See modules/notifications/jobs/notificationRetry.job.js.
 //////////////////////////////////////////////////////////////
 
-const notificationRetryJob = startJob("notificationRetry", () => startNotificationRetryJob());
+const notificationRetryJob = startNotificationRetryJob();
 
 // FA-P4-D Step 1 — Cashfree auto-payout reconciliation (no-op unless Cashfree is configured
 // and a CASHFREE payout is in flight).
-const cashfreePayoutReconcileJob = startJob("cashfreePayoutReconcile", () => startCashfreePayoutReconcileJob());
+const cashfreePayoutReconcileJob = startCashfreePayoutReconcileJob();
 
 // STEP 6.4 — Razorpay Route (GenericPayoutRequest) reconciliation (no-op unless
 // Razorpay Route is configured and a RAZORPAY_ROUTE payout is in flight).
-const genericPayoutReconcileJob = startJob("genericPayoutReconcile", () => startGenericPayoutReconcileJob());
+const genericPayoutReconcileJob = startGenericPayoutReconcileJob();
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 8: START SERVER

@@ -170,8 +170,8 @@ check(
   /import\s*\{\s*startBookingReadinessChangeJob\s*\}\s*from\s*"\.\/jobs\/bookingReadinessChange\.job\.js"/.test(serverSrc)
 );
 check(
-  "server.js: starts the job (const bookingReadinessChangeJob = startJob(\"bookingReadinessChange\", () => startBookingReadinessChangeJob());)",
-  /const bookingReadinessChangeJob = startJob\("bookingReadinessChange", \(\) => startBookingReadinessChangeJob\(\)\);/.test(serverSrc)
+  "server.js: starts the job (const bookingReadinessChangeJob = startBookingReadinessChangeJob();)",
+  /const bookingReadinessChangeJob = startBookingReadinessChangeJob\(\);/.test(serverSrc)
 );
 check(
   "server.js: stops the job in shutdown alongside the other existing jobs",
@@ -179,9 +179,9 @@ check(
 );
 check(
   "server.js: every pre-existing job start call (autoComplete/autoStart/weeklyScheduleMaterializer) still present, untouched",
-  serverSrc.includes('const autoCompleteJob = startJob("autoComplete", () => startAutoCompleteJob(io));') &&
-  serverSrc.includes('const autoStartJob = startJob("autoStart", () => startAutoStartJob(io));') &&
-  serverSrc.includes('const weeklyScheduleMaterializerJob = startJob("weeklyScheduleMaterializer", () => startWeeklyScheduleMaterializerJob());')
+  serverSrc.includes("const autoCompleteJob = startAutoCompleteJob(io);") &&
+  serverSrc.includes("const autoStartJob = startAutoStartJob(io);") &&
+  serverSrc.includes("const weeklyScheduleMaterializerJob = startWeeklyScheduleMaterializerJob();")
 );
 
 // ── 10. Salon App — OPEN_HOME added, OPEN_BOOKING preserved ─────────

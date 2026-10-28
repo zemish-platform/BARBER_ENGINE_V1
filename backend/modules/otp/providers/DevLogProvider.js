@@ -25,7 +25,6 @@
  */
 
 import logger from "../../../utils/logger.js";
-import { isStagingEnv } from "../../../utils/stagingGuards.js";
 import { OtpProvider } from "./OtpProvider.js";
 
 export class DevLogProvider extends OtpProvider {
@@ -35,18 +34,6 @@ export class DevLogProvider extends OtpProvider {
 
   async sendOtp(phone, otp) {
     const startedAt = Date.now();
-
-    // STAGING: honest no-op — the OTP (a tester's secret, or an unusable token)
-    // and the phone are never logged. Nothing is sent anywhere.
-    if (isStagingEnv()) {
-      return {
-        success: true,
-        provider: this.name,
-        messageId: null,
-        latencyMs: Date.now() - startedAt,
-        error: null,
-      };
-    }
 
     if (process.env.NODE_ENV !== "production") {
       logger.debug(`[DEV SMS] OTP for +91${phone}: ${otp}`);
