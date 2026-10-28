@@ -46,6 +46,8 @@ import {
   STAGING_DB_NAME,
   STAGING_SHARED_DEV_ACK_VAR,
   STAGING_SHARED_DEV_DB_NAME,
+  STAGING_SMS_ALLOWED_PHONES_VAR,
+  STAGING_SMS_MODE_VAR,
 } from "../utils/stagingGuards.js";
 import { assertEnvironmentIdentity, STAGING_MARKER_VARIABLES } from "../utils/environmentIdentity.js";
 import { REGISTERED_JOB_NAMES } from "../utils/stagingJobAllowlist.js";
@@ -331,7 +333,9 @@ await test("I7", "marker list cannot drift: it equals the staging-only variables
   // Static completeness: every STAGING_* env var read in stagingGuards.js is a marker, and every marker is read there.
   const source = fs.readFileSync(path.join(BACKEND_DIR, "utils/stagingGuards.js"), "utf8");
   const read = new Set([...source.matchAll(/\benv\.(STAGING_[A-Z0-9_]+)/g)].map((m) => m[1]));
-  read.add(STAGING_SHARED_DEV_ACK_VAR);
+  read.add(STAGING_SHARED_DEV_ACK_VAR); // read through a named constant, not `env.STAGING_*`
+  read.add(STAGING_SMS_MODE_VAR);
+  read.add(STAGING_SMS_ALLOWED_PHONES_VAR);
   expect(JSON.stringify([...read].sort()) === JSON.stringify([...STAGING_MARKER_VARIABLES].sort()), `marker list differs from the guard's reads: guard=${[...read].sort()} markers=${[...STAGING_MARKER_VARIABLES].sort()}`);
 
   const entry = pathToFileURL(path.join(BACKEND_DIR, "config/stagingBootGuard.js")).href;
@@ -790,7 +794,7 @@ const freePort = () => new Promise((resolve) => { const s = net.createServer(); 
 const portOpen = (port) => new Promise((resolve) => { const s = net.connect(port, "127.0.0.1"); s.once("connect", () => { s.destroy(); resolve(true); }); s.once("error", () => resolve(false)); });
 
 // Runs the real server.js; resolves when it exits, or ~1.2 s after it printed "Server running".
-const runServer = async (env, { fakeMode = "plain", connectionName, connectionStatus, preflight = {} } = {}) => {
+const runServerOnce = async (env, { fakeMode = "plain", connectionName, connectionStatus, preflight = {} } = {}) => {
   const port = await freePort();
   const child = spawn(process.execPath, ["--import", pathToFileURL(PRELOAD).href, path.join(BACKEND_DIR, "server.js")], {
     cwd: tmp,
@@ -833,6 +837,19 @@ const runServer = async (env, { fakeMode = "plain", connectionName, connectionSt
     preflightConnectLine: idx(/preflight connect called/), preflightCommandLine: idx(/preflight command/), preflightCloseLine: idx(/preflight client closed/),
     preflightPassLine: idx(/Staging pre-flight passed/), connectLine: idx(/mongoose\.connect called/),
   };
+};
+
+// The port comes from binding a throwaway server, closing it and handing the number to the child, which leaves a small window
+// in which another process can take it ("listen EADDRINUSE" — reproduced in a stress loop: 1 in 60 concurrent spawns). That is a
+// harness race, not server behaviour, so retry with a fresh port when — and ONLY when — that exact error is why the child exited.
+// Every other exit (refusals, crashes) is returned untouched.
+const runServer = async (env, opts = {}) => {
+  let result;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    result = await runServerOnce(env, opts);
+    if (!(result.code === 1 && /EADDRINUSE/.test(result.err))) return result;
+  }
+  return result;
 };
 
 // Staging starts NO background job unless STAGING_ENABLED_JOBS names it, so the scenarios that prove "jobs start only after the gate"
