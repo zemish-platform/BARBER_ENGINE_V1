@@ -317,6 +317,33 @@ const BookingSchema = new mongoose.Schema(
       },
     },
 
+    // PLATFORM-FEE GST snapshot — the GST charged on the Platform Fee
+    // itself (commissionAmountInPaise above). Both values are calculated
+    // by services/bookingPricing.service.js from the PUBLISHED
+    // GstPolicyVersion's platformFeeGstRatePercent and are passed to
+    // Booking.create() by lockSlot; they are already part of
+    // totalAmountInPaise (service + commission + gstAmountInPaise +
+    // platformFeeGstAmountInPaise). They were not declared here, so
+    // Mongoose strict mode silently dropped them on save. This only
+    // persists the already-calculated values — it changes no calculation.
+    // Same null-vs-zero convention as gstRatePercent/gstAmountInPaise:
+    // null means "no value stored" (e.g. a booking saved before this
+    // declaration existed), 0 means "computed as zero". Rate is in
+    // percent; amount is in whole paise.
+    platformFeeGstRatePercent: {
+      type:    Number,
+      default: null,
+      min:     [0, "platformFeeGstRatePercent cannot be negative"],
+    },
+    platformFeeGstAmountInPaise: {
+      type:    Number,
+      default: null,
+      validate: {
+        validator: (v) => v === null || (Number.isInteger(v) && v >= 0),
+        message:   "platformFeeGstAmountInPaise must be a non-negative whole number (paise) or null",
+      },
+    },
+
     // STEP 8.2 (policy version follow-up) — audit-trail ONLY, never used
     // for any dollar calculation (that stays totalAmountInPaise/
     // serviceAmountInPaise/commissionAmountInPaise/gstAmountInPaise
