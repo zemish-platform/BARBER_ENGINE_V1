@@ -43,6 +43,7 @@ function getOrCreateEntry(name, intervalMs) {
       lastFailureAt: null,
       lastFailureMessage: null,
       consecutiveFailures: 0,
+      disabled: false,
     };
     registry.set(name, entry);
   } else if (intervalMs != null && entry.intervalMs == null) {
@@ -99,7 +100,19 @@ export function recordFailure(name, err) {
   entry.consecutiveFailures += 1;
 }
 
+/**
+ * Called by server.js (via utils/productionJobGate.js) for a job that was
+ * intentionally NOT started. Reported as status "DISABLED", which the
+ * overall rollup does not count as STALE / NEVER_RAN / FAILED. A job that
+ * nevertheless records a start is reported from its real timings again.
+ */
+export function recordDisabled(name) {
+  const entry = getOrCreateEntry(name);
+  entry.disabled = true;
+}
+
 function computeStatus(entry, now) {
+  if (entry.disabled && !entry.lastStartedAt) return "DISABLED";
   if (!entry.lastStartedAt) return "NEVER_RAN";
   if (entry.isRunning) return "RUNNING";
 
@@ -133,6 +146,7 @@ export function getStatus() {
       intervalMs: entry.intervalMs,
       staleAfterMs: entry.staleAfterMs,
       status,
+      disabled: entry.disabled,
       isRunning: entry.isRunning,
       lastStartedAt: entry.lastStartedAt ? entry.lastStartedAt.toISOString() : null,
       lastSuccessAt: entry.lastSuccessAt ? entry.lastSuccessAt.toISOString() : null,
