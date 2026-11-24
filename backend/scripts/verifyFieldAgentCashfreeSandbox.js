@@ -4,8 +4,9 @@
  *
  * FA-P4-D Step 1 — LIVE verification against the real Cashfree SANDBOX
  * (no stub). Refuses to run unless CASHFREE_ENV is SANDBOX. Uses the
- * CASHFREE_CLIENT_ID / CASHFREE_CLIENT_SECRET already in .env — values are
- * never printed.
+ * Payouts-only CASHFREE_PAYOUT_CLIENT_ID / CASHFREE_PAYOUT_CLIENT_SECRET from
+ * .env (NOT the Secure ID CASHFREE_CLIENT_ID / CASHFREE_CLIENT_SECRET) and
+ * refuses to run without them — values are never printed.
  *
  * Steps: (0) preflight — is the server allowed to call Payouts at all?
  * (1) real withdrawal, Auto Payout ON (Revenue Settings endpoint), real admin
@@ -37,7 +38,7 @@ import FieldAgentAuditEvent from "../modules/fieldAgent/models/FieldAgentAuditEv
 import KYC from "../modules/kyc/models/KYC.js";
 import { encrypt } from "../modules/kyc/services/encryption.service.js";
 import { reconcileCashfreePayouts } from "../modules/fieldAgent/services/fieldAgentAutoPayout.service.js";
-import { getTransfer, getPayoutBaseUrl } from "../services/settlement/cashfree/cashfreePayoutClient.js";
+import { getTransfer, getPayoutBaseUrl, isCashfreePayoutConfigured } from "../services/settlement/cashfree/cashfreePayoutClient.js";
 
 const P = "ZTEST_FAP4D1SBX_";
 const oid = () => new mongoose.Types.ObjectId();
@@ -64,6 +65,7 @@ const purge = async () => {
 
 const run = async () => {
   if (process.env.CASHFREE_ENV === "PRODUCTION") { console.error("Refusing to run: CASHFREE_ENV is PRODUCTION"); process.exit(2); }
+  if (!isCashfreePayoutConfigured()) { console.error("Refusing to run: CASHFREE_PAYOUT_CLIENT_ID / CASHFREE_PAYOUT_CLIENT_SECRET are not set (Payouts-only sandbox credentials)"); process.exit(2); }
   if (process.env.CF_SANDBOX_ALLOW_OVERRIDE !== "1") delete process.env.CASHFREE_PAYOUT_BASE_URL; // real sandbox, no stub (override only for dry-running this script itself)
   console.log(`Cashfree Payouts base: ${getPayoutBaseUrl()} (env ${process.env.CASHFREE_ENV})`);
 
