@@ -26,6 +26,10 @@ import http from "http";
 import mongoose from "mongoose";
 
 process.env.CASHFREE_PAYOUT_WEBHOOK_SECRET = "ztest_webhook_secret_fap4d1";
+// Payouts-only credentials (the Secure ID CASHFREE_CLIENT_ID/SECRET no longer configure Payouts).
+// Synthetic values: every request goes to the local stub server below, never to Cashfree.
+process.env.CASHFREE_PAYOUT_CLIENT_ID = "ztest_payout_client_id";
+process.env.CASHFREE_PAYOUT_CLIENT_SECRET = "ztest_payout_client_secret";
 
 import app from "../app.js";
 import connectDB from "../config/db.js";
@@ -396,7 +400,7 @@ const run = async () => {
     }
     check("L1 every fixture wallet reconciles with its ledger (Available/Locked/Processing)", allOk);
     const agentView = JSON.stringify((await call(`${W}/mine`, s1.token)).data);
-    check("L2 agent payout API shows status/UTR only — never provider response or secrets", agentView.includes("PAID") && !agentView.includes("providerResponse") && !agentView.includes(process.env.CASHFREE_CLIENT_SECRET));
+    check("L2 agent payout API shows status/UTR only — never provider response or secrets", agentView.includes("PAID") && !agentView.includes("providerResponse") && !agentView.includes(process.env.CASHFREE_PAYOUT_CLIENT_SECRET));
   } catch (err) {
     fail++; results.push(`❌ UNEXPECTED ERROR — ${err.stack || err}`);
   } finally {

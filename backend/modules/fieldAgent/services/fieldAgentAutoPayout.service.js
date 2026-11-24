@@ -255,6 +255,9 @@ export const selectPayoutProvider = async (payout) => {
  * Safe to call repeatedly (deterministic beneficiary + transfer ids).
  */
 export const dispatchCashfreeTransfer = async (payoutId) => {
+  // Without Payouts credentials nothing can be sent: leave the payout exactly as it is
+  // (still PROCESSING, funds held) — no DB read, no state change, no network call.
+  if (!isCashfreePayoutConfigured()) return { dispatched: false, reason: "CASHFREE_PAYOUT_NOT_CONFIGURED" };
   const payout = await FieldAgentPayoutRequest.findById(payoutId);
   if (!payout || payout.status !== FIELD_AGENT_PAYOUT_STATUS.PROCESSING || payout.payoutProvider !== FIELD_AGENT_PAYOUT_PROVIDER.CASHFREE) {
     return { dispatched: false, reason: "NOT_IN_FLIGHT" };
