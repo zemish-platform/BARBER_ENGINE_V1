@@ -12,6 +12,8 @@
  *       hold expired / booking not payable / duplicate or orphan payment
  *                                 -> automatic Razorpay refund (once per payment)
  *       amount or currency mismatch -> NEEDS_REVIEW, no automatic action
+ *   wallet top-up (captured / order.paid) -> credited via services/walletTopupCredit.service.js
+ *                       (same rules as /add-money/verify); validation failure -> NEEDS_REVIEW
  *   payment.failed   -> recorded only (the customer can retry the same order)
  *   refund.processed -> P0-C: completes the Refund record, updates the Transaction and
  *                       (fully refunded) Booking.paymentStatus = REFUNDED; a refund of a payment that
@@ -31,7 +33,7 @@
 import mongoose from "mongoose";
 import Booking, { BOOKING_STATUS } from "../models/Booking.js";
 import Transaction from "../models/Transaction.js";
-import WalletTransaction from "../models/WalletTransaction.js";
+import WalletTransaction, { WALLET_TXN_TYPE } from "../models/WalletTransaction.js";
 import WebhookEvent, {
   WEBHOOK_PROVIDER,
   WEBHOOK_EVENT_KIND,
@@ -45,6 +47,7 @@ import {
 import Refund from "../models/Refund.js";
 import { completeRefund, issueRazorpayRefund, recordExternalRefund } from "./RazorpayRefundService.js";
 import { runBookingConfirmationCore, runBookingConfirmedEffects } from "../controllers/booking.controller.js";
+import { creditTopupFromPayment, findTopupForOrder, TOPUP_CREDIT_OUTCOME } from "./walletTopupCredit.service.js";
 import logger from "../utils/logger.js";
 
 const LEASE_MS = 2 * 60 * 1000;
@@ -200,6 +203,30 @@ const issueAutoRefund = async ({ payment, bookingId, reason }) => {
   }
 };
 
+// ─── WALLET TOP-UP ──────────────────────────────────────────────────
+/**
+ * A captured payment for a wallet top-up order: credited through the SAME service
+ * as POST /add-money/verify (status exactly "captured", order/amount/currency
+ * match, one atomic PENDING→SUCCESS + credit). Any validation failure is
+ * NEEDS_REVIEW — never PROCESSED, never a credit, never a refund.
+ */
+const handleWalletTopupCaptured = async ({ payment, orderId }) => {
+  const txn = await findTopupForOrder(orderId);
+  if (!txn) return { status: WEBHOOK_EVENT_STATUS.IGNORED, outcome: "WALLET_TOPUP_NOT_FOUND" };
+  const r = await creditTopupFromPayment({ txn, payment, via: "webhook" }); // throws on DB trouble → FAILED, Razorpay retries
+  if (r.outcome === TOPUP_CREDIT_OUTCOME.CREDITED) {
+    return { status: WEBHOOK_EVENT_STATUS.PROCESSED, outcome: "WALLET_TOPUP_CREDITED" };
+  }
+  if (r.outcome === TOPUP_CREDIT_OUTCOME.ALREADY_CREDITED) {
+    return { status: WEBHOOK_EVENT_STATUS.PROCESSED, outcome: "WALLET_TOPUP_ALREADY_CREDITED" };
+  }
+  if (r.outcome === TOPUP_CREDIT_OUTCOME.NOT_CAPTURED || r.outcome === TOPUP_CREDIT_OUTCOME.PAYMENT_FAILED) {
+    return { status: WEBHOOK_EVENT_STATUS.IGNORED, outcome: `WALLET_TOPUP_${r.outcome}` };
+  }
+  logger.error("[RazorpayWebhook] captured wallet top-up failed validation — needs review", { walletTxnId: String(txn._id), outcome: r.outcome });
+  return { status: WEBHOOK_EVENT_STATUS.NEEDS_REVIEW, outcome: `WALLET_TOPUP_${r.outcome}` };
+};
+
 // ─── EVENT HANDLERS ─────────────────────────────────────────────────
 const handleCaptured = async ({ payment, order, app }) => {
   const paymentId = payment?.id;
@@ -212,7 +239,7 @@ const handleCaptured = async ({ payment, order, app }) => {
   }
 
   const found = await findBookingForOrder(orderId);
-  if (found.walletTopup) return { status: WEBHOOK_EVENT_STATUS.IGNORED, outcome: "WALLET_TOPUP" };
+  if (found.walletTopup) return handleWalletTopupCaptured({ payment, orderId });
   if (!found.booking) return { status: WEBHOOK_EVENT_STATUS.IGNORED, outcome: "UNKNOWN_ORDER" };
   const { booking, orphan } = found;
   const base = { bookingId: booking._id };
@@ -274,7 +301,20 @@ const handleRefundProcessed = async ({ refund, payment }) => {
   doc = await completeRefund({ refundDoc: doc, gatewayStatus: refund.status, gatewayRefundId: refund.id });
 
   const base = { bookingId: doc.bookingId || null, refundId: refund.id, amountInPaise: refund.amount };
-  if (!doc.bookingId) return { ...base, status: WEBHOOK_EVENT_STATUS.PROCESSED, outcome: "REFUND_RECORDED" };
+  if (!doc.bookingId) {
+    // A refund of a wallet top-up payment (the engine never refunds top-ups, so it came from
+    // outside, e.g. the dashboard): the wallet was credited and is NOT debited automatically.
+    const topupOrderId = doc.orderId || payment?.order_id || null;
+    const isTopup = await WalletTransaction.exists({
+      type: WALLET_TXN_TYPE.TOPUP,
+      $or: [{ razorpayPaymentId: paymentId }, ...(topupOrderId ? [{ razorpayOrderId: topupOrderId }] : [])],
+    });
+    if (isTopup) {
+      logger.error("[RazorpayWebhook] refund on a wallet top-up payment — wallet not debited, needs review", { refundId: refund.id });
+      return { ...base, status: WEBHOOK_EVENT_STATUS.NEEDS_REVIEW, outcome: "REFUND_ON_WALLET_TOPUP" };
+    }
+    return { ...base, status: WEBHOOK_EVENT_STATUS.PROCESSED, outcome: "REFUND_RECORDED" };
+  }
 
   const paidByThisPayment = await Transaction.exists({ paymentId });
   if (paidByThisPayment) {
