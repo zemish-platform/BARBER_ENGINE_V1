@@ -273,9 +273,10 @@ await test("W4", "ORDER in server.js: boot guard first; pre-flight → connectDB
   const guard = at('import "./config/stagingBootGuard.js"');
   expect(guard < at('import connectDB') && guard < at('from "./app.js"') && guard < at("config/redis"), "the boot guard is not imported before the app, database and Redis modules") ;
   // startJob must come from createJobStarter — and from nowhere else (a stub/pass-through that merely mentions the name would
-  // start every job on staging).
-  const creation = /let startJob;\s*try \{\s*startJob = createJobStarter\(\{ env: process\.env \}\);/.exec(code);
-  expect(creation !== null, "startJob is not created by `startJob = createJobStarter({ env: process.env })` inside the guarded try block");
+  // start every job on staging). The staging starter is wrapped, unchanged, by the production job gate
+  // (utils/jobStarterComposition.js; behaviour verified by scripts/verifyJobStarterComposition.js).
+  const creation = /let startJob;\s*try \{\s*startJob = withProductionJobGate\(createJobStarter\(\{ env: process\.env \}\), \{ env: process\.env, onDisabled: recordJobDisabled \}\);/.exec(code);
+  expect(creation !== null, "startJob is not created by `startJob = withProductionJobGate(createJobStarter({ env: process.env }), …)` inside the guarded try block");
   expect((code.match(/\bstartJob\s*=(?!=)/g) || []).length === 1, "startJob is assigned more than once");
   expect(!/\b(function startJob|const startJob|var startJob)\b/.test(code), "startJob is declared a second way");
   expect((code.match(/\bcreateJobStarter\(/g) || []).length === 1, "createJobStarter is called more than once, or not at all");

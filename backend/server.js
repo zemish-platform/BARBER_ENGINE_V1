@@ -28,6 +28,9 @@ import { initSocket } from "./socket/index.js";
 import { isStagingEnv } from "./utils/stagingGuards.js";
 import { runStagingPreflight, runStagingStartupGate } from "./utils/stagingStartupGate.js";
 import { createJobStarter } from "./utils/stagingJobAllowlist.js";
+import { isDisabledJobController, isProductionJobGateActive } from "./utils/productionJobGate.js";
+import { isSkippedJobController, withProductionJobGate } from "./utils/jobStarterComposition.js";
+import { recordDisabled as recordJobDisabled } from "./jobs/jobHeartbeat.js";
 
 //////////////////////////////////////////////////////////////
 // 🔑 STEP 1: LOAD ENVIRONMENT VARIABLES
@@ -138,14 +141,23 @@ if (isStagingEnv()) {
 // (unset or blank = none). The list is validated here, in full, before ANY job is
 // started; an invalid list exits the process instead of starting a subset. (The boot
 // guard has already rejected an invalid list before MongoDB/Redis were touched.)
-// On production, development, test or an unset NODE_ENV every job starts exactly as
-// before: startJob(name, fn) simply calls fn().
+// On development, test or an unset NODE_ENV every job starts exactly as before:
+// startJob(name, fn) simply calls fn().
 // See utils/stagingJobAllowlist.js.
+//
+// 🔒 PRODUCTION JOB GATE (outer layer — utils/productionJobGate.js)
+// In production NO background job starts: the gate never calls the staging
+// starter or the job's start function while it is active (NODE_ENV=production,
+// the production Render service identity, or any Render service not on exactly
+// NODE_ENV=staging). There is no activation list — STAGING_ENABLED_JOBS cannot
+// reach production jobs, and enabling a production job requires an approved code
+// change. Jobs not started by either layer are reported as status "DISABLED" by
+// GET /health/ops. See utils/jobStarterComposition.js.
 //////////////////////////////////////////////////////////////
 
 let startJob;
 try {
-  startJob = createJobStarter({ env: process.env });
+  startJob = withProductionJobGate(createJobStarter({ env: process.env }), { env: process.env, onDisabled: recordJobDisabled });
 } catch (error) {
   console.error(`❌ Refusing to start — ${error.message}`);
   process.exit(1);
@@ -389,7 +401,11 @@ const server = httpServer.listen(PORT, () => {
   console.log(`🗄️  MongoDB:     ${mongoose.connection.readyState === 1 ? "connected" : "connecting..."}`);
   console.log(`🧠 Redis:       ${redis.isReady ? "connected" : "unavailable"}`);
   console.log("📡 Socket.IO:   READY");
-  console.log("⚙️  Jobs:        Hold Expiry + Customer Arrival + Service Overdue + Auto Complete + Reminder + Auto Start + SLA Scanner + Rating Outbox + Weekly Schedule Materializer + Field Agent KYC Sync + Fraud Detection + Cross-Agent Overlap + Territory Assignment Overlap + Field Agent Earning + OTP Audit Outbox RUNNING");
+  console.log(
+    isProductionJobGateActive(process.env)
+      ? "⚙️  Jobs:        ALL 19 DISABLED (production job gate)"
+      : "⚙️  Jobs:        Hold Expiry + Customer Arrival + Service Overdue + Auto Complete + Reminder + Auto Start + SLA Scanner + Rating Outbox + Weekly Schedule Materializer + Field Agent KYC Sync + Fraud Detection + Cross-Agent Overlap + Territory Assignment Overlap + Field Agent Earning + OTP Audit Outbox RUNNING"
+  );
   console.log("📡 System Mode: Enterprise Ready (1 Lakh+ Scale)");
   console.log("--------------------------------------------------");
 });
@@ -411,6 +427,16 @@ const server = httpServer.listen(PORT, () => {
 //   - Container restart issues in Docker / Kubernetes
 //////////////////////////////////////////////////////////////
 
+// Logs whether a job was really stopped or was never started (disabled by the
+// production job gate, or not enabled in STAGING_ENABLED_JOBS — its stop() is a
+// no-op). Logging only: every stop() call below runs exactly as before.
+const logJobShutdown = (job, label) =>
+  console.log(isDisabledJobController(job)
+    ? `⏸️  ${label} job was not running (disabled by the production job gate)`
+    : isSkippedJobController(job)
+      ? `⏸️  ${label} job was not running (not enabled in STAGING_ENABLED_JOBS)`
+      : `✅ ${label} job stopped`);
+
 const shutdown = async (signal) => {
   console.log(`\n⚠️  ${signal} received — graceful shutdown initiated...`);
 
@@ -421,57 +447,59 @@ const shutdown = async (signal) => {
       // Stop background workers first — prevents any in-flight DB
       // writes from racing against MongoDB closing below.
       holdExpiryJob.stop();
-      console.log("✅ Hold expiry job stopped");
+      logJobShutdown(holdExpiryJob, "Hold expiry");
 
       customerArrivalJob.stop();
-      console.log("✅ Customer arrival job stopped");
+      logJobShutdown(customerArrivalJob, "Customer arrival");
 
       serviceOverdueJob.stop();
-      console.log("✅ Service overdue job stopped");
+      logJobShutdown(serviceOverdueJob, "Service overdue");
 
       autoCompleteJob.stop();
-      console.log("✅ Auto complete job stopped");
+      logJobShutdown(autoCompleteJob, "Auto complete");
 
       reminderJob.stop();
-      console.log("✅ Reminder job stopped");
+      logJobShutdown(reminderJob, "Reminder");
 
       autoStartJob.stop();
-      console.log("✅ Auto start job stopped");
+      logJobShutdown(autoStartJob, "Auto start");
 
       slaScannerJob.stop();
-      console.log("✅ SLA scanner job stopped");
+      logJobShutdown(slaScannerJob, "SLA scanner");
 
       ratingOutboxJob.stop();
-      console.log("✅ Rating outbox job stopped");
+      logJobShutdown(ratingOutboxJob, "Rating outbox");
 
       weeklyScheduleMaterializerJob.stop();
-      console.log("✅ Weekly schedule materializer job stopped");
+      logJobShutdown(weeklyScheduleMaterializerJob, "Weekly schedule materializer");
 
       bookingReadinessChangeJob.stop();
-      console.log("✅ Booking readiness change job stopped");
+      logJobShutdown(bookingReadinessChangeJob, "Booking readiness change");
 
       fieldAgentKycSyncJob.stop();
-      console.log("✅ Field Agent KYC sync job stopped");
+      logJobShutdown(fieldAgentKycSyncJob, "Field Agent KYC sync");
 
       fraudDetectionJob.stop();
-      console.log("✅ Fraud detection job stopped");
+      logJobShutdown(fraudDetectionJob, "Fraud detection");
 
       crossAgentOverlapJob.stop();
-      console.log("✅ Cross-agent overlap job stopped");
+      logJobShutdown(crossAgentOverlapJob, "Cross-agent overlap");
 
       territoryAssignmentOverlapJob.stop();
-      console.log("✅ Territory assignment overlap job stopped");
+      logJobShutdown(territoryAssignmentOverlapJob, "Territory assignment overlap");
 
       fieldAgentEarningJob.stop();
-      console.log("✅ Field Agent earning job stopped");
+      logJobShutdown(fieldAgentEarningJob, "Field Agent earning");
 
       otpAuditOutboxJob.stop();
-      console.log("✅ OTP audit outbox job stopped");
+      logJobShutdown(otpAuditOutboxJob, "OTP audit outbox");
 
       notificationRetryJob.stop();
       cashfreePayoutReconcileJob.stop();
       genericPayoutReconcileJob.stop();
-      console.log("✅ Notification retry job stopped");
+      logJobShutdown(notificationRetryJob, "Notification retry");
+      logJobShutdown(cashfreePayoutReconcileJob, "Cashfree payout reconcile");
+      logJobShutdown(genericPayoutReconcileJob, "Generic payout reconcile");
 
       // Drain all open sockets before closing the DB — ensures no
       // realtime emit fires against a closed MongoDB connection.

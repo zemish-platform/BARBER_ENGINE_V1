@@ -1049,14 +1049,18 @@ await test("B6c", "REAL server.js: a RENAMED staging service on another branch i
 
 const prodEnv = () => ({ NODE_ENV: "production", OTP_SECRET: rnd(24), OTP_ENCRYPT_KEY: rnd(24), ADMIN_RESET_PASSWORD: `Adm!${rnd(8)}`, JWT_ACCESS_SECRET: rnd(24), MONGODB_URI: atlasSrv(ATLAS_PROD_ID, "prod_db_fixture"), REDIS_URL: redisUri(REDIS_PROD_HOST) });
 
-await test("B7", "PRODUCTION (zemish-production-api, branch main, NODE_ENV=production) regression: no pre-flight, no gate, no privilege query; mongoose.connect then jobs then listen, exactly as before — with and without RENDER_GIT_BRANCH", async () => {
+// Production starts NO background job (utils/productionJobGate.js — founder rule: all 19 disabled in production), so the
+// production regression proves connect-before-listen and the gate's 0-of-19 confirmation instead of a job order.
+const gateDisabledAll = (r) => r.jobStarts === 0 && /Production job gate: 0 of 19 background jobs enabled/.test(r.out) && (r.out.match(/disabled \(production job gate\)/g) || []).length === 19;
+
+await test("B7", "PRODUCTION (zemish-production-api, branch main, NODE_ENV=production) regression: no pre-flight, no gate, no privilege query; mongoose.connect then listen as before, and 0 of 19 jobs (production job gate) — with and without RENDER_GIT_BRANCH", async () => {
   for (const [label, extra] of [["branch main", { RENDER_GIT_BRANCH: "main" }], ["no branch variable", {}]]) {
     const r = await runServer({ ...prodEnv(), RENDER: "true", RENDER_SERVICE_NAME: "zemish-production-api", ...extra }, { fakeMode: "plain" });
     expect(r.listening && r.openWhileRunning, `${label}: production did not start (exit ${r.code}); tail: ${redact(r.err.slice(-300))}`);
     expect(r.gateLine === -1 && r.statusCalls === 0, `${label}: the staging gate ran on production`);
     expect(r.preflightConnects === 0 && r.preflightCloses === 0 && r.preflightCommands.length === 0 && r.preflightPassLine === -1, `${label}: the staging pre-flight ran on production`);
-    expect(r.mongooseConnects === 1 && r.connectLine < r.firstJob, `${label}: mongoose.connect was not called exactly once before the jobs`);
-    expect(r.jobStarts >= 10 && r.firstJob >= 0 && r.firstJob < r.listenLine, `${label}: production job/listen order changed (jobs start before listen)`);
+    expect(r.mongooseConnects === 1 && r.connectLine >= 0 && r.connectLine < r.listenLine, `${label}: mongoose.connect was not called exactly once before listen`);
+    expect(gateDisabledAll(r), `${label}: production did not report all 19 jobs disabled by the production job gate (${r.jobStarts} started)`);
     noLeak(`${r.out}${r.err}`, `${label} output`);
   }
 });
@@ -1065,7 +1069,6 @@ await test("B8", "LOCAL DEVELOPMENT regression: no Render variables — no pre-f
   for (const [label, extra] of [
     ["development", {}],
     ["development with RENDER_GIT_BRANCH=develop", { RENDER_GIT_BRANCH: "develop" }],
-    ["development with RENDER_GIT_BRANCH=main", { RENDER_GIT_BRANCH: "main" }],
   ]) {
     const r = await runServer({ NODE_ENV: "development", OTP_SECRET: rnd(24), MONGODB_URI: atlasSrv(ATLAS_STAGING_ID, "dev_db_fixture"), ...extra }, { fakeMode: "plain" });
     expect(r.listening && r.openWhileRunning, `${label}: did not start (exit ${r.code})`);
@@ -1073,6 +1076,14 @@ await test("B8", "LOCAL DEVELOPMENT regression: no Render variables — no pre-f
     expect(r.preflightConnects === 0 && r.preflightCommands.length === 0 && r.preflightPassLine === -1, `${label}: the staging pre-flight ran`);
     expect(r.mongooseConnects === 1 && r.connectLine < r.firstJob, `${label}: mongoose.connect not called once before the jobs`);
     expect(r.jobStarts >= 10 && r.firstJob < r.listenLine, `${label}: job/listen order changed`);
+  }
+  // A checkout that carries production's branch (RENDER_GIT_BRANCH=main, RENDER unset) is still not staging, but the production
+  // job gate treats branch main as the production identity and fails closed: it starts, listens, and runs no background job.
+  {
+    const r = await runServer({ NODE_ENV: "development", OTP_SECRET: rnd(24), MONGODB_URI: atlasSrv(ATLAS_STAGING_ID, "dev_db_fixture"), RENDER_GIT_BRANCH: "main" }, { fakeMode: "plain" });
+    expect(r.listening && r.openWhileRunning, `development with RENDER_GIT_BRANCH=main: did not start (exit ${r.code})`);
+    expect(r.gateLine === -1 && r.statusCalls === 0 && r.preflightConnects === 0, "development with RENDER_GIT_BRANCH=main: the staging gate or pre-flight ran");
+    expect(r.mongooseConnects === 1 && gateDisabledAll(r), "development with RENDER_GIT_BRANCH=main: connect not once, or jobs not all disabled by the production job gate");
   }
   // Production-mode flags without Render identity (e.g. a developer running with NODE_ENV=production) are also untouched.
   const r = await runServer({ ...prodEnv(), RENDER_GIT_BRANCH: "develop" }, { fakeMode: "plain" });
