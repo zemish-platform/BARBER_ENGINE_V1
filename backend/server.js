@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "./config/stagingBootGuard.js"; // must stay directly after dotenv and BEFORE app.js — see that file
 import http from "http";
 import mongoose from "mongoose"; // ← IMPROVEMENT-2: needed for DB close + health check
 import app from "./app.js";
@@ -24,8 +25,9 @@ import { startNotificationRetryJob } from "./modules/notifications/jobs/notifica
 import { startCashfreePayoutReconcileJob } from "./modules/fieldAgent/jobs/cashfreePayoutReconcile.job.js"; // ← FA-P4-D Step 1 — polls in-flight Cashfree Field Agent payouts whose webhook never arrived; idempotent, multi-instance safe
 import { startGenericPayoutReconcileJob } from "./modules/payout/jobs/genericPayoutReconcile.job.js"; // ← STEP 6.4 — polls in-flight RAZORPAY_ROUTE GenericPayoutRequest payouts whose webhook never arrived; idempotent, multi-instance safe; safe no-op when Razorpay Route isn't configured
 import { initSocket } from "./socket/index.js";
-import { createProductionJobGate, isDisabledJobController, isProductionJobGateActive } from "./utils/productionJobGate.js";
-import { recordDisabled as recordJobDisabled } from "./jobs/jobHeartbeat.js";
+import { isStagingEnv } from "./utils/stagingGuards.js";
+import { runStagingPreflight, runStagingStartupGate } from "./utils/stagingStartupGate.js";
+import { createJobStarter } from "./utils/stagingJobAllowlist.js";
 
 //////////////////////////////////////////////////////////////
 // 🔑 STEP 1: LOAD ENVIRONMENT VARIABLES
@@ -53,7 +55,16 @@ if (process.env.NODE_ENV === "production" && process.env.ALLOW_FIXED_OTP === "tr
 // 🔑 STEP 2: CONNECT DATABASE (MongoDB)
 //////////////////////////////////////////////////////////////
 
-connectDB();
+// STAGING ONLY: verify the target and the credentials' scope with a raw, read-only driver client BEFORE
+// Mongoose connects. Once Mongoose connects it creates collections/indexes for every model (autoIndex),
+// which would otherwise happen before any post-connect check could reject the credentials.
+// Skipped entirely on production and local development (no await, no extra connection).
+if (isStagingEnv()) {
+  const stagingPreflight = await runStagingPreflight({ MongoClient: mongoose.mongo.MongoClient });
+  if (!stagingPreflight.ok) process.exit(1);
+}
+
+const dbConnected = connectDB(); // same call, same moment as before; the promise is only used by the staging gate below
 
 //////////////////////////////////////////////////////////////
 // 🔑 STEP 3: REDIS LIFECYCLE LOGGING
@@ -105,18 +116,40 @@ try {
 app.set("io", io);
 
 //////////////////////////////////////////////////////////////
-// 🔒 STEP 7a: PRODUCTION JOB GATE (production — and any Render service not on NODE_ENV=staging)
+// 🔒 STEP 7a: STAGING STARTUP GATE (staging only — skipped entirely elsewhere)
 //
-// In production NO background job starts: every start call below goes through
-// startJob(), which never calls the job's start function while the gate is
-// active and returns a no-op { stop } controller instead. There is no
-// activation list — enabling a production job requires an approved code change
-// to utils/productionJobGate.js. On NODE_ENV=staging and local development
-// startJob(name, fn) simply calls fn(), so their behaviour is unchanged.
-// Disabled jobs are reported as status "DISABLED" by GET /health/ops.
+// Nothing below this line — no background job, no httpServer.listen() — runs
+// on staging until the live MongoDB connection has been verified: connected
+// database name + every effective privilege scoped to that one database
+// (see utils/stagingStartupGate.js). On any failure the process exits here.
+// On production and local development this block is not executed at all, so
+// their startup order and timing are unchanged.
 //////////////////////////////////////////////////////////////
 
-const startJob = createProductionJobGate({ env: process.env, onDisabled: recordJobDisabled });
+if (isStagingEnv()) {
+  const stagingGate = await runStagingStartupGate(dbConnected, { mongoose });
+  if (!stagingGate.ok) process.exit(1);
+}
+
+//////////////////////////////////////////////////////////////
+// 🔒 STEP 7a-2: BACKGROUND-JOB ALLOW-LIST (staging only — pass-through elsewhere)
+//
+// On staging NO background job starts unless it is named in STAGING_ENABLED_JOBS
+// (unset or blank = none). The list is validated here, in full, before ANY job is
+// started; an invalid list exits the process instead of starting a subset. (The boot
+// guard has already rejected an invalid list before MongoDB/Redis were touched.)
+// On production, development, test or an unset NODE_ENV every job starts exactly as
+// before: startJob(name, fn) simply calls fn().
+// See utils/stagingJobAllowlist.js.
+//////////////////////////////////////////////////////////////
+
+let startJob;
+try {
+  startJob = createJobStarter({ env: process.env });
+} catch (error) {
+  console.error(`❌ Refusing to start — ${error.message}`);
+  process.exit(1);
+}
 
 //////////////////////////////////////////////////////////////
 // 🚀 STEP 7b: START HOLD EXPIRY BACKGROUND JOB
@@ -356,11 +389,7 @@ const server = httpServer.listen(PORT, () => {
   console.log(`🗄️  MongoDB:     ${mongoose.connection.readyState === 1 ? "connected" : "connecting..."}`);
   console.log(`🧠 Redis:       ${redis.isReady ? "connected" : "unavailable"}`);
   console.log("📡 Socket.IO:   READY");
-  console.log(
-    isProductionJobGateActive(process.env)
-      ? "⚙️  Jobs:        ALL 19 DISABLED (production job gate)"
-      : "⚙️  Jobs:        Hold Expiry + Customer Arrival + Service Overdue + Auto Complete + Reminder + Auto Start + SLA Scanner + Rating Outbox + Weekly Schedule Materializer + Field Agent KYC Sync + Fraud Detection + Cross-Agent Overlap + Territory Assignment Overlap + Field Agent Earning + OTP Audit Outbox RUNNING"
-  );
+  console.log("⚙️  Jobs:        Hold Expiry + Customer Arrival + Service Overdue + Auto Complete + Reminder + Auto Start + SLA Scanner + Rating Outbox + Weekly Schedule Materializer + Field Agent KYC Sync + Fraud Detection + Cross-Agent Overlap + Territory Assignment Overlap + Field Agent Earning + OTP Audit Outbox RUNNING");
   console.log("📡 System Mode: Enterprise Ready (1 Lakh+ Scale)");
   console.log("--------------------------------------------------");
 });
@@ -382,14 +411,6 @@ const server = httpServer.listen(PORT, () => {
 //   - Container restart issues in Docker / Kubernetes
 //////////////////////////////////////////////////////////////
 
-// Logs whether a job was really stopped or was never started (disabled by the
-// production job gate — its stop() is a no-op). Logging only: every stop() call
-// below runs exactly as before.
-const logJobShutdown = (job, label) =>
-  console.log(isDisabledJobController(job)
-    ? `⏸️  ${label} job was not running (disabled by the production job gate)`
-    : `✅ ${label} job stopped`);
-
 const shutdown = async (signal) => {
   console.log(`\n⚠️  ${signal} received — graceful shutdown initiated...`);
 
@@ -400,59 +421,57 @@ const shutdown = async (signal) => {
       // Stop background workers first — prevents any in-flight DB
       // writes from racing against MongoDB closing below.
       holdExpiryJob.stop();
-      logJobShutdown(holdExpiryJob, "Hold expiry");
+      console.log("✅ Hold expiry job stopped");
 
       customerArrivalJob.stop();
-      logJobShutdown(customerArrivalJob, "Customer arrival");
+      console.log("✅ Customer arrival job stopped");
 
       serviceOverdueJob.stop();
-      logJobShutdown(serviceOverdueJob, "Service overdue");
+      console.log("✅ Service overdue job stopped");
 
       autoCompleteJob.stop();
-      logJobShutdown(autoCompleteJob, "Auto complete");
+      console.log("✅ Auto complete job stopped");
 
       reminderJob.stop();
-      logJobShutdown(reminderJob, "Reminder");
+      console.log("✅ Reminder job stopped");
 
       autoStartJob.stop();
-      logJobShutdown(autoStartJob, "Auto start");
+      console.log("✅ Auto start job stopped");
 
       slaScannerJob.stop();
-      logJobShutdown(slaScannerJob, "SLA scanner");
+      console.log("✅ SLA scanner job stopped");
 
       ratingOutboxJob.stop();
-      logJobShutdown(ratingOutboxJob, "Rating outbox");
+      console.log("✅ Rating outbox job stopped");
 
       weeklyScheduleMaterializerJob.stop();
-      logJobShutdown(weeklyScheduleMaterializerJob, "Weekly schedule materializer");
+      console.log("✅ Weekly schedule materializer job stopped");
 
       bookingReadinessChangeJob.stop();
-      logJobShutdown(bookingReadinessChangeJob, "Booking readiness change");
+      console.log("✅ Booking readiness change job stopped");
 
       fieldAgentKycSyncJob.stop();
-      logJobShutdown(fieldAgentKycSyncJob, "Field Agent KYC sync");
+      console.log("✅ Field Agent KYC sync job stopped");
 
       fraudDetectionJob.stop();
-      logJobShutdown(fraudDetectionJob, "Fraud detection");
+      console.log("✅ Fraud detection job stopped");
 
       crossAgentOverlapJob.stop();
-      logJobShutdown(crossAgentOverlapJob, "Cross-agent overlap");
+      console.log("✅ Cross-agent overlap job stopped");
 
       territoryAssignmentOverlapJob.stop();
-      logJobShutdown(territoryAssignmentOverlapJob, "Territory assignment overlap");
+      console.log("✅ Territory assignment overlap job stopped");
 
       fieldAgentEarningJob.stop();
-      logJobShutdown(fieldAgentEarningJob, "Field Agent earning");
+      console.log("✅ Field Agent earning job stopped");
 
       otpAuditOutboxJob.stop();
-      logJobShutdown(otpAuditOutboxJob, "OTP audit outbox");
+      console.log("✅ OTP audit outbox job stopped");
 
       notificationRetryJob.stop();
       cashfreePayoutReconcileJob.stop();
       genericPayoutReconcileJob.stop();
-      logJobShutdown(notificationRetryJob, "Notification retry");
-      logJobShutdown(cashfreePayoutReconcileJob, "Cashfree payout reconcile");
-      logJobShutdown(genericPayoutReconcileJob, "Generic payout reconcile");
+      console.log("✅ Notification retry job stopped");
 
       // Drain all open sockets before closing the DB — ensures no
       // realtime emit fires against a closed MongoDB connection.
