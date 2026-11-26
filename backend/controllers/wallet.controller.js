@@ -18,6 +18,8 @@ import {
 } from "../services/Razorpay.service.js";
 import { toFriendlyId } from "../utils/friendlyId.js";
 import logger from "../utils/logger.js";
+import { isStagingEnv } from "../utils/stagingGuards.js";
+import { creditTopupFromPayment, TOPUP_CREDIT_OUTCOME } from "../services/walletTopupCredit.service.js";
 
 //////////////////////////////////////////////////////////////
 // CONSTANTS
@@ -26,10 +28,8 @@ import logger from "../utils/logger.js";
 const MIN_TOPUP_RUPEES = 10;
 const MAX_TOPUP_RUPEES = 50000;
 
-// Razorpay payment statuses that count as "money actually received".
-// A valid signature alone doesn't mean this — status must be checked
-// separately (see fetchRazorpayPayment call in verifyTopup below).
-const CAPTURED_PAYMENT_STATUSES = ["captured", "authorized"];
+// Only a CAPTURED payment is money received. The capture/amount/order/currency
+// rules live in services/walletTopupCredit.service.js, shared with the webhook.
 
 //////////////////////////////////////////////////////////////
 // RATE LIMITER — payment-related endpoints, exported for routes
@@ -120,14 +120,18 @@ export const createTopupOrder = async (req, res) => {
 // POST /api/v1/wallet/add-money/verify
 // Body: { orderId, paymentId, signature }
 //
-// Sequence: signature verify → duplicate paymentId check → fetch
-// live payment status from Razorpay (captured/authorized required,
-// not just a valid signature) → atomic PENDING→SUCCESS transition →
-// credit wallet — all inside one Mongo session.
+// Sequence: duplicate paymentId check → signature verify → fetch the
+// payment from Razorpay → creditTopupFromPayment (shared with the
+// webhook): status exactly "captured", order/amount/currency match,
+// then one atomic PENDING→SUCCESS + wallet credit. "authorized" is
+// NOT money yet: the row stays PENDING and the captured webhook
+// credits it later (202). A mismatch never credits (review flag).
 //////////////////////////////////////////////////////////////
 
+const TOPUP_REVIEW_MESSAGE =
+  "We could not match this payment to your top-up. It has been flagged for review — please contact support if money was deducted.";
+
 export const verifyTopup = async (req, res) => {
-  const session = await mongoose.startSession();
   try {
     const userId = req.user?.id;
     if (!userId) {
@@ -148,10 +152,11 @@ export const verifyTopup = async (req, res) => {
       return res.status(404).json({ success: false, message: "Top-up order not found" });
     }
 
-    // Idempotency — already verified once (e.g. client retried after
-    // a slow response). Safe no-op.
-    if (txn.status === WALLET_TXN_STATUS.SUCCESS) {
-      return res.json({ success: true, message: "Already credited" });
+    // Idempotency — this same payment was already credited (client
+    // retried, or the webhook got there first). Safe no-op.
+    if (txn.status === WALLET_TXN_STATUS.SUCCESS && txn.razorpayPaymentId === paymentId) {
+      const u = await User.findOne({ _id: userId, isDeleted: false }).select("walletBalance").lean();
+      return res.json({ success: true, message: "Already credited", walletBalance: u?.walletBalance ?? null });
     }
 
     // Explicit duplicate check — this exact paymentId must not be
@@ -182,83 +187,50 @@ export const verifyTopup = async (req, res) => {
     // Signature valid ≠ money received — confirm with Razorpay's own
     // record of the payment before crediting anything.
     const payment = await fetchRazorpayPayment(paymentId);
-    if (!CAPTURED_PAYMENT_STATUSES.includes(payment?.status)) {
-      await WalletTransaction.updateOne(
-        { _id: txn._id, status: WALLET_TXN_STATUS.PENDING },
-        {
-          status: WALLET_TXN_STATUS.FAILED,
-          failureCode: WALLET_TXN_FAILURE_CODE.PAYMENT_FAILED,
-          failureReason: `Payment status was "${payment?.status}", not captured`,
-        }
-      );
-      return res.status(400).json({ success: false, message: "Payment was not captured" });
+    if (payment?.id !== paymentId) {
+      logger.error("WALLET VERIFY TOPUP: fetched payment id differs from the requested one", { walletTxnId: String(txn._id) });
+      return res.status(409).json({ success: false, needsReview: true, message: TOPUP_REVIEW_MESSAGE });
     }
+    const result = await creditTopupFromPayment({ txn, payment, signature, via: "verify" });
 
-    const amountRupees = txn.amountInPaise / 100;
-    let updatedUser;
-    let balanceBeforeInPaise;
+    switch (result.outcome) {
+      case TOPUP_CREDIT_OUTCOME.CREDITED:
+        return res.json({ success: true, message: "Wallet credited successfully", walletBalance: result.walletBalance });
 
-    await session.withTransaction(async () => {
-      const currentUser = await User.findOne({ _id: userId, isDeleted: false })
-        .select("walletBalance")
-        .session(session);
-      if (!currentUser) throw new Error("User not found");
-      balanceBeforeInPaise = Math.round((currentUser.walletBalance || 0) * 100);
+      case TOPUP_CREDIT_OUTCOME.ALREADY_CREDITED:
+        return res.json({ success: true, message: "Already credited", walletBalance: result.walletBalance });
 
-      updatedUser = await User.findOneAndUpdate(
-        { _id: userId, isDeleted: false },
-        { $inc: { walletBalance: amountRupees } },
-        { new: true, session }
-      ).select("walletBalance");
+      case TOPUP_CREDIT_OUTCOME.NOT_CAPTURED:
+        // e.g. "authorized": not money yet. Row stays PENDING; the captured webhook credits it.
+        return res.status(202).json({
+          success: false,
+          pending: true,
+          message: "Your payment is being confirmed by the bank. Your wallet will be credited automatically once it completes.",
+        });
 
-      // Atomic PENDING→SUCCESS transition — the filter itself
-      // requires status still be PENDING, so a concurrent duplicate
-      // call for the same txn can never both succeed (second call's
-      // matchedCount is 0, caught below).
-      const transitionResult = await WalletTransaction.updateOne(
-        { _id: txn._id, status: WALLET_TXN_STATUS.PENDING },
-        {
-          status: WALLET_TXN_STATUS.SUCCESS,
-          source: WALLET_TXN_SOURCE.RAZORPAY,
-          razorpayPaymentId: paymentId,
-          razorpaySignature: signature,
-          balanceBeforeInPaise,
-          balanceAfterInPaise: Math.round(updatedUser.walletBalance * 100),
-        },
-        { session }
-      );
+      case TOPUP_CREDIT_OUTCOME.PAYMENT_FAILED:
+        await WalletTransaction.updateOne(
+          { _id: txn._id, status: WALLET_TXN_STATUS.PENDING },
+          {
+            status: WALLET_TXN_STATUS.FAILED,
+            failureCode: WALLET_TXN_FAILURE_CODE.PAYMENT_FAILED,
+            failureReason: 'Payment status was "failed", not captured',
+          }
+        );
+        return res.status(400).json({ success: false, message: "Payment was not captured" });
 
-      if (transitionResult.matchedCount === 0) {
-        // Another concurrent request already transitioned this txn —
-        // abort so the wallet $inc above rolls back with the session.
-        throw new Error("Transaction already processed concurrently");
-      }
-    });
+      case TOPUP_CREDIT_OUTCOME.NOT_FOUND:
+        return res.status(404).json({ success: false, message: "Top-up order not found" });
 
-    await NotificationService.send({
-      recipientId:   userId,
-      recipientType: "USER",
-      templateKey:   NOTIFICATION_EVENTS.WALLET_CREDIT,
-      variables:     { amount: Math.round(amountRupees) },
-      title:         "Wallet Credited",
-      message:       `₹${Math.round(amountRupees)} has been added to your wallet.`,
-      type:          "PAYMENT",
-      priority:      "MEDIUM",
-      actionType:    "OPEN_WALLET",
-      actionUrl:     "/wallet",
-      meta:          { walletTransactionId: txn._id, amountInPaise: txn.amountInPaise },
-    });
-
-    return res.json({
-      success: true,
-      message: "Wallet credited successfully",
-      walletBalance: updatedUser.walletBalance,
-    });
+      default:
+        // Every review outcome (order/amount/currency/user mismatch, refunded, credited by a
+        // different payment, payment already used, row not PENDING): no credit, flagged.
+        logger.error("WALLET VERIFY TOPUP NEEDS REVIEW", { walletTxnId: String(txn._id), outcome: result.outcome });
+        return res.status(409).json({ success: false, needsReview: true, message: TOPUP_REVIEW_MESSAGE });
+    }
   } catch (error) {
     logger.error("WALLET VERIFY TOPUP ERROR", { message: error.message, stack: error.stack });
     return res.status(500).json({ success: false, message: "Top-up verification failed" });
-  } finally {
-    session.endSession();
   }
 };
 
@@ -385,11 +357,13 @@ export const getWalletBalance = async (req, res) => {
 // flow automatically (see walletApi.js / WalletScreen.js).
 //
 // HARD-LOCKED to non-production — never reachable in prod even if
-// someone tries to call it directly.
+// someone tries to call it directly. Also locked on staging, where real
+// Razorpay test-mode checkout is used and this would credit wallets for free.
+// The 404 is returned before any database or wallet work.
 //////////////////////////////////////////////////////////////
 
 export const mockVerifyTopup = async (req, res) => {
-  if (process.env.NODE_ENV === "production") {
+  if (process.env.NODE_ENV === "production" || isStagingEnv()) {
     return res.status(404).json({ success: false, message: "Not found" });
   }
 

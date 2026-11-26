@@ -3309,7 +3309,7 @@ export const generateNoShowOtp = async (req, res) => {
       throw Object.assign(new Error("Customer phone number not available"), { status: 409 });
     }
 
-    const otp        = generateOtp();
+    const otp        = generateOtp({ phone: booking.userRef.phone });
     const otpHashed   = hashOtp(otp);
     const now         = new Date();
     const expiresAt   = new Date(now.getTime() + 5 * 60 * 1000); // 5 min validity
