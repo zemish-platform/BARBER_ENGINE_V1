@@ -4,6 +4,7 @@ import { verifySession } from "../services/session.service.js";
 import { generateAccessToken } from "../services/token.service.js";
 import logger from "../utils/logger.js";
 import { AppError, Errors } from "../utils/response.js";
+import { isAdminActivationBlocked } from "../utils/adminActivationGate.js";
 
 export const protect = async (req, res, next) => {
   try {
@@ -116,7 +117,7 @@ export const protect = async (req, res, next) => {
 
     if (!session) {
       const liveUser = await User.findById(decoded.id).select(
-        "_id role tokenVersion isActive isDeleted accountStatus mustChangePassword adminLevel countryRef stateRef districtRef cityRef"
+        "_id role tokenVersion isActive isDeleted accountStatus mustChangePassword adminAssignedAt adminLevel countryRef stateRef districtRef cityRef"
       );
 
       if (!liveUser) {
@@ -180,7 +181,7 @@ export const protect = async (req, res, next) => {
     // ADMIN account still pending activation (seeded/assigned, password
     // never set by its owner) is refused server-side on every route,
     // regardless of what the Admin Panel shows.
-    if (user.role === "ADMIN" && user.mustChangePassword === true) {
+    if (isAdminActivationBlocked(user)) {
       logger.warn("Blocked request from admin account pending activation", {
         userId: user._id.toString(),
       });

@@ -240,6 +240,7 @@ async function seedDistricts() {
       const stateAdmin = await User.findOne({
         role: "ADMIN",
         adminLevel: "STATE",
+        adminSubRole: "PRIMARY",
         stateRef: state._id,
         isDeleted: false,
       });
@@ -322,10 +323,10 @@ async function seedDistricts() {
         await User.updateOne(
           { _id: existingPrimary._id },
           {
+            // Existing account is REUSED as-is: same _id; name, phone, email,
+            // password, assignment and enabled/disabled status are never
+            // overwritten by a re-run.
             $set: {
-              name: `${entry.name} DISTRICT ADMIN`,
-              isActive: true,
-              isDeleted: false,
               permissions: ["DISTRICT_FULL_ACCESS"],
 
               // 🔥 ENSURE FIELD EXISTS (SAFE UPDATE)

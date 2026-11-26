@@ -1003,9 +1003,23 @@ export const assignDistrictAdmin = async (req, res, next) => {
     }
     phone = cleanPhone;
 
-    const existingAdmin = district.primaryAdminRef
+    // The district's existing PRIMARY admin account (seeded placeholder or a
+    // real holder). It is always REUSED — same _id, stateRef, districtRef,
+    // adminLevel — never duplicated. If primaryAdminRef is stale, fall back to
+    // the live PRIMARY account for this district.
+    let existingAdmin = district.primaryAdminRef
       ? await User.findById(district.primaryAdminRef).session(session)
       : null;
+    if (existingAdmin && (existingAdmin.isDeleted === true || existingAdmin.role !== "ADMIN" ||
+        existingAdmin.adminLevel !== "DISTRICT" || String(existingAdmin.districtRef) !== String(district._id))) {
+      existingAdmin = null;
+    }
+    if (!existingAdmin) {
+      existingAdmin = await User.findOne({
+        role: "ADMIN", adminLevel: "DISTRICT", adminSubRole: "PRIMARY",
+        districtRef: district._id, isDeleted: { $ne: true },
+      }).session(session);
+    }
 
     const [existingPhone, existingEmail] = await Promise.all([
       User.findOne({
@@ -1029,21 +1043,21 @@ export const assignDistrictAdmin = async (req, res, next) => {
       return next(Errors.conflict("Email already linked to another admin account"));
     }
 
-    // Is the existing admin a placeholder (seed-time ghost, phone
-    // never set) or a real person (genuine transfer)? Placeholder
-    // admins get UPDATED in place -- their ID already exists and is
-    // already linked to this district, so overwriting is correct and
-    // avoids leaving 778 orphaned SUSPENDED user records behind.
-    // Real transfers keep the old create-new + deactivate-old
-    // behavior, to preserve who genuinely held the role historically.
-    const isPlaceholder = existingAdmin && !existingAdmin.phone;
-
+    // Placeholder (seeded, phone never set) vs. real transfer (a previous
+    // employee held it). BOTH are handled in place: the account keeps its _id
+    // and hierarchy links; the previous holder's credentials die because
+    // markAdminAssigned() replaces the password and every session is revoked
+    // below. Who held it before is preserved in the audit log.
+    const isPlaceholder = !!existingAdmin && !existingAdmin.phone;
+    const wasTransfer = !!existingAdmin && !isPlaceholder;
+    const previousHolder = wasTransfer
+      ? { name: existingAdmin.name, phone: `******${String(existingAdmin.phone).slice(-4)}` }
+      : null;
 
     let newAdmin;
-    let wasPlaceholderConversion = false;
+    const wasPlaceholderConversion = isPlaceholder;
 
-    if (isPlaceholder) {
-      // Convert placeholder in place -- no new ID, no orphaned record.
+    if (existingAdmin) {
       existingAdmin.name               = adminName;
       existingAdmin.phone              = phone;
       existingAdmin.email              = email?.trim() || null;
@@ -1052,16 +1066,9 @@ export const assignDistrictAdmin = async (req, res, next) => {
       await markAdminAssigned(existingAdmin, req.user.id);
       await existingAdmin.save({ session });
       newAdmin = existingAdmin;
-      wasPlaceholderConversion = true;
     } else {
-      // Real transfer (existing admin already had a real phone) OR
-      // no existing admin at all -- original create-new behavior.
-      if (existingAdmin) {
-        existingAdmin.accountStatus = "SUSPENDED";
-        existingAdmin.isDeleted     = true;
-        await existingAdmin.save({ session });
-      }
-
+      // No DISTRICT PRIMARY account exists at all for this district — the only
+      // case that creates one (nothing to duplicate).
       [newAdmin] = await User.create([{
         name:              adminName,
         phone,
@@ -1083,9 +1090,8 @@ export const assignDistrictAdmin = async (req, res, next) => {
 
     await session.commitTransaction();
 
-    // Kill any session held by the converted account or the previous holder.
+    // Kill every session on the account (incl. a previous holder's).
     await revokeAllSessions(newAdmin._id);
-    if (existingAdmin && !isPlaceholder) await revokeAllSessions(existingAdmin._id);
 
     logAdminAction({
       adminId: req.user.id,
@@ -1094,15 +1100,16 @@ export const assignDistrictAdmin = async (req, res, next) => {
       targetId: district._id,
       meta: {
         newAdminId: newAdmin._id, newAdminName: newAdmin.name,
-        previousAdminId: wasPlaceholderConversion ? null : (existingAdmin?._id || null),
-        wasTransfer: !isPlaceholder && !!existingAdmin,
+        previousAdminId: null, // account reused in place — same _id
+        previousHolder,
+        wasTransfer,
         wasPlaceholderConversion,
       },
       req,
     });
 
     return successResponse(res, {
-      message: (!isPlaceholder && existingAdmin)
+      message: wasTransfer
         ? `District admin transferred for "${district.name}"`
         : `District admin assigned for "${district.name}"`,
       data: {
@@ -1112,8 +1119,8 @@ export const assignDistrictAdmin = async (req, res, next) => {
           email: newAdmin.email, adminLevel: newAdmin.adminLevel,
           activation: "PENDING_ACTIVATION",
         },
-        previousAdmin: (!isPlaceholder && existingAdmin)
-          ? { id: existingAdmin._id, name: existingAdmin.name, status: "DEACTIVATED" }
+        previousAdmin: wasTransfer
+          ? { id: newAdmin._id, name: previousHolder.name, status: "REPLACED" }
           : null,
       },
     });

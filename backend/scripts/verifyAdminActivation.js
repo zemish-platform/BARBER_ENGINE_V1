@@ -154,7 +154,7 @@ const LEGACY_TEMP_PW = "Admin@12345";  // the old ADMIN_RESET_PASSWORD fallback
 const seedHash = await bcrypt.hash(SEED_PW, 10);
 const countryRef = oid();
 const stateA = oid(), stateB = oid();
-const distA1 = oid(), distA2 = oid(), distB1 = oid();
+const distA1 = oid(), distA2 = oid(), distB1 = oid(), distB2 = oid();
 
 const mkAdmin = (doc) => User.create({ role: "ADMIN", countryRef, isActive: true, isDeleted: false, accountStatus: "ACTIVE", password: seedHash, mustChangePassword: true, ...doc });
 const india = await mkAdmin({ name: "ZT India", email: "zt-india@ztest.local", phone: "9000000001", adminLevel: "INDIA", isPhoneVerified: true });
@@ -164,11 +164,14 @@ const saB = await mkAdmin({ name: "State B", email: "state-admin-zb@yourapp.inte
 const daA1 = await mkAdmin({ name: "District A1", email: "district-admin-za-a1@internal.local", phone: null, adminLevel: "DISTRICT", adminSubRole: "PRIMARY", stateRef: stateA, districtRef: distA1 });
 const daA2 = await mkAdmin({ name: "District A2", email: "district-admin-za-a2@internal.local", phone: null, adminLevel: "DISTRICT", adminSubRole: "PRIMARY", stateRef: stateA, districtRef: distA2 });
 const daB1 = await mkAdmin({ name: "District B1", email: "district-admin-zb-b1@internal.local", phone: null, adminLevel: "DISTRICT", adminSubRole: "PRIMARY", stateRef: stateB, districtRef: distB1 });
+// Like the 4 staging placeholders found in the audit: seeded, never assigned, but mustChangePassword false.
+const daB2 = await mkAdmin({ name: "District B2", email: "district-admin-zb-b2@internal.local", phone: "9100000009", adminLevel: "DISTRICT", adminSubRole: "PRIMARY", stateRef: stateB, districtRef: distB2, mustChangePassword: false });
 // District docs (raw insert — only the fields the legacy controllers read).
 await District.collection.insertMany([
   { _id: distA1, name: "ZT A1", code: "ZTA1", slug: "zt-a1", normalizedName: "zt a1", stateRef: stateA, countryRef, primaryAdminRef: daA1._id, isActive: true, isDeleted: false },
   { _id: distA2, name: "ZT A2", code: "ZTA2", slug: "zt-a2", normalizedName: "zt a2", stateRef: stateA, countryRef, primaryAdminRef: daA2._id, isActive: true, isDeleted: false },
   { _id: distB1, name: "ZT B1", code: "ZTB1", slug: "zt-b1", normalizedName: "zt b1", stateRef: stateB, countryRef, primaryAdminRef: daB1._id, isActive: true, isDeleted: false },
+  { _id: distB2, name: "ZT B2", code: "ZTB2", slug: "zt-b2", normalizedName: "zt b2", stateRef: stateB, countryRef, primaryAdminRef: daB2._id, isActive: true, isDeleted: false },
 ]);
 
 const STRONG = { india: "India#Founder2026", sa: "StateA#Employee26", saNew: "StateA#Rotated2026", da: "DistA1#Employee26" };
@@ -199,6 +202,11 @@ const KEY = process.env.ADMIN_PANEL_KEY;
   const forged = generateAccessToken({ _id: saA._id, role: "ADMIN", tokenVersion: 0, adminLevel: "STATE", stateRef: stateA, countryRef });
   const p1 = await call("/api/admin/me", { token: forged });
   check("1.5", "protect refuses a (validly signed) token for a pending account → 403", p1.status === 403 && codeOf(p1).includes("ACCOUNT_ACTIVATION_REQUIRED"), p1.data);
+  const l1d = await login(daB2.email, SEED_PW);
+  check("1.6", "never-assigned placeholder with mustChangePassword=false + seed password → 403, no session", l1d.status === 403 && codeOf(l1d).includes("ACCOUNT_ACTIVATION_REQUIRED") && !tokenOf(l1d) && !l1d.setCookie, l1d.data);
+  const forgedB2 = generateAccessToken({ _id: daB2._id, role: "ADMIN", tokenVersion: 0, adminLevel: "DISTRICT", stateRef: stateB, districtRef: distB2, countryRef });
+  check("1.7", "protect refuses a token for that never-assigned placeholder → 403", (await call("/api/admin/me", { token: forgedB2 })).status === 403);
+  check("1.8", "password-reset OTP for that placeholder's phone → not issued", (await requestOtp("RESET", daB2.phone)).status === 200 && !(await redis.exists(otpHashKey(RST, daB2.phone))));
 
   // ═══ 2. generated phone/email alone cannot activate ═════════════
   section("2  knowing a seeded email/phone is not enough");
@@ -312,6 +320,8 @@ const KEY = process.env.ADMIN_PANEL_KEY;
   section("10  existing India/State/District permissions intact");
   const li = await list(tIndia, "?adminLevel=STATE");
   check("10.1", "INDIA lists STATE accounts (all states) → 200, 3 items", li.status === 200 && li.data?.data?.items?.length === 3, li.data);
+  const lu = await list(tIndia, "?adminLevel=DISTRICT&status=UNASSIGNED");
+  check("10.1b", "never-assigned placeholder with mustChangePassword=false is listed as UNASSIGNED", lu.status === 200 && lu.data?.data?.items?.some((x) => String(x.id) === String(daB2._id) && x.status === "UNASSIGNED"), lu.data);
   check("10.2", "INDIA list never includes the INDIA account itself", !(await list(tIndia)).data?.data?.items?.some((x) => x.adminLevel === "INDIA"));
   check("10.3", "STATE → POST /api/admin/states (INDIA-only) → 403", (await call("/api/admin/states", { token: tStateA, method: "POST", body: { stateName: "X", adminName: "X", phone: "9876543210" } })).status === 403);
   check("10.4", "DISTRICT → POST /api/admin/districts (INDIA/STATE-only) → 403", (await call("/api/admin/districts", { token: tDistA1, method: "POST", body: {} })).status === 403);
@@ -363,8 +373,39 @@ const KEY = process.env.ADMIN_PANEL_KEY;
   const lgDoc = await fresh(daA2._id);
   check("14.3", "account pending activation with assignment marker", lgDoc.mustChangePassword === true && !!lgDoc.adminAssignedAt && lgDoc.phone === "9844444444");
   check("14.4", "legacy temp password and seed password → cannot log in", (await login("legacy.flow@ztest.local", LEGACY_TEMP_PW)).status === 401 && (await login("legacy.flow@ztest.local", SEED_PW)).status === 401);
+  // Real transfer through the legacy endpoint: the SAME account is reused, never a new one.
+  await requestOtp("ACTIVATION", "9844444444");
+  check("14.5", "legacy-flow employee activates via OTP", (await complete("ACTIVATION", "9844444444", DEV_FIXED_OTP, "Legacy#Holder2026")).status === 200);
+  const holder = await login("legacy.flow@ztest.local", "Legacy#Holder2026");
+  const adminCountBefore = await User.countDocuments({ role: "ADMIN" });
+  const tr = await call(`/api/admin/districts/${distA2}/admin`, { token: tIndia, method: "POST", body: { adminName: "Next Holder", phone: "9866666666", email: "next.holder@ztest.local" } });
+  const trDoc = await fresh(daA2._id);
+  check("14.6", "transfer → 200, same _id reused (phone/email/name updated in place)", tr.status === 200 && String(tr.data?.data?.admin?.id) === String(daA2._id) && trDoc.phone === "9866666666" && trDoc.isDeleted !== true, tr.data);
+  check("14.7", "transfer created no new admin account and deleted none", (await User.countDocuments({ role: "ADMIN" })) === adminCountBefore && (await User.countDocuments({ role: "ADMIN", districtRef: distA2 })) === 1 && (await User.countDocuments({ role: "ADMIN", isDeleted: true })) === 0);
+  check("14.8", "hierarchy preserved (stateRef, districtRef, adminLevel, district.primaryAdminRef)", String(trDoc.stateRef) === String(stateA) && String(trDoc.districtRef) === String(distA2) && trDoc.adminLevel === "DISTRICT" && String((await District.findById(distA2).lean()).primaryAdminRef) === String(daA2._id));
+  check("14.9", "previous holder's token, refresh cookie and password are dead", (await call("/api/admin/me", { token: tokenOf(holder) })).status === 401 && (await call("/api/admin-auth/refresh", { method: "POST", cookie: holder.cookie })).status === 401 && (await login("next.holder@ztest.local", "Legacy#Holder2026")).status === 401);
+  check("14.10", "new holder is PENDING_ACTIVATION; previous holder kept in audit meta (masked phone)", trDoc.mustChangePassword === true && !!(await AdminAuditLog.exists({ action: "DISTRICT_ADMIN_ASSIGNED", targetId: distA2, "meta.wasTransfer": true, "meta.previousHolder.phone": "******4444" })));
   const bk = await call(`/api/admin/states/${stateB}/backup-admin`, { token: tIndia, method: "POST", body: { adminName: "Backup B", phone: "9855555555", email: "backup.b@ztest.local" } });
-  check("14.5", "backup-admin flow (no State doc) still 404s cleanly", bk.status === 404, bk.data);
+  check("14.11", "backup-admin flow (no State doc) still 404s cleanly", bk.status === 404, bk.data);
+
+  // ═══ 14b. seed scripts (static — seeds are never executed here) ══
+  section("14b  seed scripts reuse existing admin accounts without overwriting them");
+  const fsm = await import("fs");
+  const seedS = fsm.readFileSync(new URL("./seedMasterStates.js", import.meta.url), "utf8");
+  const seedD = fsm.readFileSync(new URL("./seedMasterDistricts.js", import.meta.url), "utf8");
+  // Every `User.updateOne(` call's full argument text, found by bracket matching.
+  const updateBlocks = (src) => {
+    const out = [];
+    for (let at = src.indexOf("User.updateOne("); at !== -1; at = src.indexOf("User.updateOne(", at + 1)) {
+      let depth = 0, k = at + "User.updateOne".length;
+      for (; k < src.length; k++) { if (src[k] === "(") depth++; else if (src[k] === ")" && --depth === 0) break; }
+      out.push(src.slice(at, k + 1));
+    }
+    return out;
+  };
+  const blocks = [...updateBlocks(seedS), ...updateBlocks(seedD)];
+  check("14b.1", "every existing-admin update in the seeds leaves name / isActive / phone / email / password untouched", blocks.length === 3 && blocks.every((b) => !/\b(name|isActive|phone|email|password|mustChangePassword)\s*:/.test(b)), blocks.length);
+  check("14b.2", "seed STATE PRIMARY lookup filters adminSubRole PRIMARY (cannot grab the backup)", /adminLevel: "STATE",\s*adminSubRole: "PRIMARY",\s*stateRef: state\._id/.test(seedS) && /adminLevel: "STATE",\s*adminSubRole: "PRIMARY",\s*stateRef: state\._id/.test(seedD));
 
   // ═══ 15. limiter + no secret leakage ════════════════════════════
   section("15  rate limit and no OTP/password leakage");

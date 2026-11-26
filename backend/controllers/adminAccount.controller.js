@@ -83,9 +83,10 @@ export const listAdminAccounts = async (req, res, next) => {
     }
     if (status) {
       const st = String(status).toUpperCase();
-      if (st === "ACTIVE") filter.mustChangePassword = { $ne: true };
+      // Same rule as adminAccountStatus(): never-assigned = UNASSIGNED regardless of mustChangePassword.
+      if (st === "ACTIVE") Object.assign(filter, { mustChangePassword: { $ne: true }, adminAssignedAt: { $ne: null } });
       else if (st === "PENDING_ACTIVATION") Object.assign(filter, { mustChangePassword: true, adminAssignedAt: { $ne: null } });
-      else if (st === "UNASSIGNED") Object.assign(filter, { mustChangePassword: true, adminAssignedAt: null });
+      else if (st === "UNASSIGNED") filter.adminAssignedAt = null;
       else return next(Errors.badRequest("status must be UNASSIGNED, PENDING_ACTIVATION or ACTIVE"));
     }
 

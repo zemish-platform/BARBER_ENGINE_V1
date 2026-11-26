@@ -41,6 +41,7 @@ import { revokeAllSessions } from "./session.service.js";
 import { logAdminAction } from "../utils/auditLog.js";
 import { AUDIT_ACTIONS } from "../utils/auditActions.js";
 import logger from "../utils/logger.js";
+import { isAdminActivationBlocked, isAssignableLevel } from "../utils/adminActivationGate.js";
 
 export const ADMIN_OTP_ROLE = "ADMIN";
 export const BCRYPT_COST = 12;
@@ -89,7 +90,7 @@ export const isActivationEligible = (admin) =>
   admin.mustChangePassword === true &&
   (!!admin.adminAssignedAt || admin.adminLevel === "INDIA");
 
-export const isResetEligible = (admin) => isUsableAccount(admin) && admin.mustChangePassword !== true;
+export const isResetEligible = (admin) => isUsableAccount(admin) && !isAdminActivationBlocked(admin);
 
 /**
  * Apply an assignment to an admin document IN MEMORY (caller saves, inside its
@@ -196,5 +197,7 @@ export const completeCredentialSet = async ({ kind, phone, otp, newPassword, req
 };
 
 /** Account status as shown to authorized admins (never includes credentials). */
-export const adminAccountStatus = (admin) =>
-  admin.mustChangePassword !== true ? "ACTIVE" : admin.adminAssignedAt ? "PENDING_ACTIVATION" : "UNASSIGNED";
+export const adminAccountStatus = (admin) => {
+  if (isAssignableLevel(admin.adminLevel) && !admin.adminAssignedAt) return "UNASSIGNED";
+  return admin.mustChangePassword === true ? "PENDING_ACTIVATION" : "ACTIVE";
+};

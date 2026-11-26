@@ -8,6 +8,7 @@ import {
   rotateSession,
 } from "../services/session.service.js";
 import { generateAccessToken } from "../services/token.service.js";
+import { isAdminActivationBlocked } from "../utils/adminActivationGate.js";
 import {
   GENERIC_REQUEST_MESSAGE,
   completeCredentialSet,
@@ -132,7 +133,7 @@ export const adminLogin = async (req, res, next) => {
     // their own password via OTP gets no session at all.
     //////////////////////////////////////////////////////
 
-    if (admin.mustChangePassword === true) {
+    if (isAdminActivationBlocked(admin)) {
       return next(
         new AppError(
           "Account activation required. Verify your phone with OTP to set your password.",
