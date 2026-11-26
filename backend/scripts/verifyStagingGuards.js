@@ -534,7 +534,8 @@ const G2_CASES = [
   ["SMS_PROVIDER=msg91", mutate({ SMS_PROVIDER: "msg91" }), "SMS_PROVIDER"],
   ["MSG91_AUTH_KEY set", mutate({ MSG91_AUTH_KEY: "synthetic" }), "MSG91_*"],
   ["TWILIO_ACCOUNT_SID set", mutate({ TWILIO_ACCOUNT_SID: "synthetic" }), "TWILIO_*"],
-  ["PUSH_PROVIDER=expo", mutate({ PUSH_PROVIDER: "expo" }), "PUSH_PROVIDER"],
+  ["PUSH_PROVIDER=fcm", mutate({ PUSH_PROVIDER: "fcm" }), "PUSH_PROVIDER"],
+  ["PUSH_PROVIDER=Expo (not the exact value)", mutate({ PUSH_PROVIDER: "Expo" }), "PUSH_PROVIDER"],
   ["EXPO_ACCESS_TOKEN set", mutate({ EXPO_ACCESS_TOKEN: "synthetic" }), "EXPO_ACCESS_TOKEN"],
   ["FIREBASE_PRIVATE_KEY set", mutate({ FIREBASE_PRIVATE_KEY: "synthetic" }), "FIREBASE_PRIVATE_KEY"],
   ["FIREBASE_PROJECT_ID set", mutate({ FIREBASE_PROJECT_ID: "synthetic" }), "FIREBASE_PROJECT_ID"],
@@ -1438,7 +1439,7 @@ await test("M1", "boot guard: standard mode (msg91, no tester logins / SMS mode 
     ["allowlist phones without the mode + msg91", stdGuardEnv({ STAGING_SMS_ALLOWED_PHONES: PHONE_L1 }), /is set but STAGING_SMS_OTP_MODE is not "allowlist"/],
     ["TWILIO_* set", stdGuardEnv({ TWILIO_ACCOUNT_SID: `AC${rnd(4)}` }), /TWILIO_\* variables must be unset/],
     ["SUREPASS_TOKEN set", stdGuardEnv({ SUREPASS_TOKEN: rnd(6) }), /SUREPASS_TOKEN must be unset/],
-    ["PUSH_PROVIDER set", stdGuardEnv({ PUSH_PROVIDER: "expo" }), /PUSH_PROVIDER must be unset or "none"/],
+    ["PUSH_PROVIDER fcm", stdGuardEnv({ PUSH_PROVIDER: "fcm" }), /PUSH_PROVIDER must be unset, "none" or exactly "expo"/],
     ["live Razorpay key", stdGuardEnv({ RAZORPAY_KEY_ID: "rzp_live_x" }), /LIVE key/],
     ["REDIS_URL missing", withoutKey(base, "REDIS_URL"), /REDIS_URL is not set/],
     ["Mongo deny-list missing", withoutKey(base, "STAGING_FORBIDDEN_MONGO_ENDPOINTS"), /STAGING_FORBIDDEN_MONGO_ENDPOINTS must be set/],
@@ -1723,6 +1724,96 @@ await test("M10", "PRODUCTION and DEVELOPMENT non-regression with msg91 configur
   for (const needle of ['"/partner/send-otp", partnerOtpLimiter', '"/partner/verify-otp", partnerVerifyLimiter', '"/user/send-otp", userOtpLimiter', '"/user/verify-otp", userVerifyLimiter']) {
     expect(routes.includes(needle), `route rate limiter missing: ${needle}`);
   }
+});
+
+// ─── P — staging push: the Expo provider is allowed; nothing else about push or any other rule is relaxed ─────────
+section("P  staging Expo push (boot guard rule R7; real PushProvider run in a child process with the Expo SDK send stubbed — no network)");
+
+await test("P1", "boot guard: PUSH_PROVIDER exactly 'expo' is accepted in all three OTP modes; unset / 'none' still accepted", async () => {
+  const configs = [
+    ["tester-login mode", safeStagingEnv()],
+    ["allowlist mode", smsGuardEnv()],
+    ["standard MSG91 mode", stdGuardEnv()],
+  ];
+  for (const [label, env] of configs) {
+    expect(assertStagingSafety(env).length === 0, `${label}: the baseline config is not clean`);
+    for (const value of ["expo", "none", " none", "NONE", undefined, ""]) {
+      const v = assertStagingSafety({ ...env, PUSH_PROVIDER: value });
+      expect(v.length === 0, `${label}: PUSH_PROVIDER=${JSON.stringify(value)} was refused: ${v.join(" | ")}`);
+    }
+  }
+});
+
+await test("P2", "boot guard: every other PUSH_PROVIDER value is still refused with exactly one violation that names the variable only; Firebase and the Expo access token stay refused with expo", async () => {
+  for (const value of ["fcm", "Expo", "EXPO", " expo", "expo ", "expo,fcm", "firebase", "apns", "true", "1"]) {
+    const v = assertStagingSafety({ ...safeStagingEnv(), PUSH_PROVIDER: value });
+    expect(v.length === 1 && /^PUSH_PROVIDER must be unset, "none" or exactly "expo"/.test(v[0]), `PUSH_PROVIDER=${JSON.stringify(value)}: expected one PUSH_PROVIDER violation, got ${JSON.stringify(v)}`);
+    expect(!v[0].includes(String(value).trim()) || ["expo", "none", "true", "1"].includes(String(value).trim()) , "the violation message echoes the configured value");
+  }
+  for (const [name, value] of [["EXPO_ACCESS_TOKEN", "synthetic"], ["FIREBASE_PROJECT_ID", "synthetic"], ["FIREBASE_CLIENT_EMAIL", "synthetic"], ["FIREBASE_PRIVATE_KEY", "synthetic"]]) {
+    const v = assertStagingSafety({ ...safeStagingEnv(), PUSH_PROVIDER: "expo", [name]: value });
+    expect(v.length === 1 && v[0].includes(name), `${name} with PUSH_PROVIDER=expo: expected exactly its own violation, got ${JSON.stringify(v)}`);
+  }
+});
+
+await test("P3", "'expo' relaxes NOTHING else: every existing rejection case (Cashfree PRODUCTION, live Razorpay, DB / Redis rules, secrets, CORS ...) gives the identical result with PUSH_PROVIDER=expo added; deny-list matches and missing deny-lists are still refused", async () => {
+  let compared = 0;
+  for (const [label, env] of G2_CASES) {
+    if ("PUSH_PROVIDER" in env) continue;
+    const without = assertStagingSafety(env);
+    const withExpo = assertStagingSafety({ ...env, PUSH_PROVIDER: "expo" });
+    expect(JSON.stringify(without) === JSON.stringify(withExpo), `${label}: adding PUSH_PROVIDER=expo changed the verdict`);
+    compared += 1;
+  }
+  expect(compared >= 40, `too few cases compared (${compared})`);
+  const mt = await import("../utils/mongoTarget.js");
+  const base = { ...safeStagingEnv(), PUSH_PROVIDER: "expo" };
+  const mongoFp = mt.mongoFingerprints(mt.parseMongoTarget(base.MONGODB_URI).hosts).join(",");
+  const redisFp = mt.redisFingerprint(mt.parseRedisTarget(base.REDIS_URL).host);
+  const has = (env, fragment) => assertStagingSafety(env).some((m) => m.includes(fragment));
+  expect(has({ ...base, STAGING_FORBIDDEN_MONGO_ENDPOINTS: mongoFp }, "MONGODB_URI points at an endpoint listed in STAGING_FORBIDDEN_MONGO_ENDPOINTS"), "a Mongo deny-list match was not refused with expo");
+  expect(has({ ...base, STAGING_FORBIDDEN_REDIS_ENDPOINTS: redisFp }, "REDIS_URL points at an endpoint listed in STAGING_FORBIDDEN_REDIS_ENDPOINTS"), "a Redis deny-list match was not refused with expo");
+  expect(has(withoutKey(base, "STAGING_FORBIDDEN_MONGO_ENDPOINTS"), "STAGING_FORBIDDEN_MONGO_ENDPOINTS must be set"), "a missing Mongo deny-list was accepted with expo");
+  expect(has(withoutKey(base, "STAGING_FORBIDDEN_REDIS_ENDPOINTS"), "STAGING_FORBIDDEN_REDIS_ENDPOINTS must be set"), "a missing Redis deny-list was accepted with expo");
+  expect(has({ ...base, CASHFREE_ENV: "PRODUCTION" }, "CASHFREE_ENV must not be PRODUCTION on staging"), "Cashfree PRODUCTION was accepted with expo");
+  expect(!assertStagingSafety({ ...base, CASHFREE_ENV: "SANDBOX" }).length, "a sandbox Cashfree config was refused with expo");
+});
+
+await test("P4", "production / development / test are untouched: the staging rule never runs there; the push provider source has no staging branch of its own", async () => {
+  for (const nodeEnv of ["production", "development", "test", undefined]) {
+    for (const value of ["expo", "fcm", "none", undefined]) {
+      const env = { ...(nodeEnv ? { NODE_ENV: nodeEnv } : {}), ...(value ? { PUSH_PROVIDER: value } : {}) };
+      expect(assertStagingSafety(env).length === 0, `${nodeEnv}/${value}: the staging push rule fired outside staging`);
+    }
+  }
+  const src = fs.readFileSync(path.join(BACKEND_DIR, "modules/notifications/providers/PushProvider.js"), "utf8");
+  expect(!/stagingGuards|isStagingEnv|staging/i.test(src), "PushProvider.js has a staging-specific branch");
+});
+
+await test("P5", "runtime: the REAL PushProvider under NODE_ENV=staging + PUSH_PROVIDER=expo hands exactly one message to the Expo SDK for the stored token, identically to production (SDK send stubbed; nothing leaves the machine)", async () => {
+  const run = (nodeEnv) => {
+    const script = `
+      const { Expo } = await import("expo-server-sdk");
+      const sent = [];
+      Expo.prototype.sendPushNotificationsAsync = async (chunk) => { sent.push(...chunk); return chunk.map(() => ({ status: "ok", id: "synthetic-ticket" })); };
+      const { default: DeviceToken } = await import(${JSON.stringify(pathToFileURL(path.join(BACKEND_DIR, "modules/notifications/models/DeviceToken.js")).href)});
+      DeviceToken.find = () => ({ lean: async () => [{ token: "ExponentPushToken[abcdefghijklmnopqrstuv]" }] });
+      const { default: PushProvider } = await import(${JSON.stringify(pathToFileURL(path.join(BACKEND_DIR, "modules/notifications/providers/PushProvider.js")).href)});
+      const r = await PushProvider.send({ recipientType: "USER", recipientId: "000000000000000000000001", title: "synthetic title", message: "synthetic body" });
+      console.log("RESULT:" + JSON.stringify({ success: r.success, provider: r.provider, error: r.error, sent: sent.map((m) => ({ to: m.to, title: m.title, body: m.body })) }));
+      process.exit(0);`;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: BACKEND_DIR, encoding: "utf8", timeout: 30_000,
+      env: { PATH: process.env.PATH, NODE_ENV: nodeEnv, PUSH_PROVIDER: "expo", SKIP_REDIS_AUTOCONNECT: "true" },
+    });
+    const line = `${r.stdout}`.split("\n").find((l) => l.startsWith("RESULT:"));
+    expect(r.status === 0 && line, `${nodeEnv}: the child run failed (exit ${r.status})`);
+    return JSON.parse(line.slice("RESULT:".length));
+  };
+  const staging = run("staging");
+  expect(staging.success === true && staging.provider === "expo" && staging.error === null, `staging: push result was ${JSON.stringify(staging)}`);
+  expect(staging.sent.length === 1 && staging.sent[0].to === "ExponentPushToken[abcdefghijklmnopqrstuv]" && staging.sent[0].title === "synthetic title", "staging: not exactly one Expo message for the stored token");
+  expect(JSON.stringify(staging) === JSON.stringify(run("production")), "staging and production push behaviour differ");
 });
 
 await new Promise((resolve) => io.close(() => resolve()));

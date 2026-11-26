@@ -70,6 +70,11 @@ jobs:
       - name: Staging job allow-list (behavioural; stub jobs only)
         run: node scripts/verifyStagingJobAllowlist.js
 
+      # Fails if Cashfree Payouts can be configured, called or webhook-verified through the Secure ID
+      # (KYC) credentials. Stubbed fetch and database; no network.
+      - name: Cashfree credential separation (stubbed fetch and database; no network)
+        run: node scripts/verifyCashfreeCredentialSeparation.js
+
       - name: App import smoke test (no database, no Redis, no network connections)
         env:
           NODE_ENV: test

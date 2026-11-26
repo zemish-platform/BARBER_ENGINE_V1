@@ -6,13 +6,19 @@
  * transfer). Transport only: no Mongo, no wallet, no lifecycle — that
  * stays in SettlementEngine's neighbours (fieldAgentAutoPayout.service.js).
  *
- * CREDENTIALS: reuses CASHFREE_CLIENT_ID / CASHFREE_CLIENT_SECRET /
- * CASHFREE_ENV already in the environment. NOTE these are the same
- * variables the Secure ID (KYC verification) provider reads; Cashfree
- * issues Payouts credentials per product, so the values must belong to
- * an account with the Payouts product enabled. Payouts additionally
- * requires the server's outbound IP to be whitelisted in the Cashfree
- * dashboard — Cashfree answers 403 "IP not whitelisted" otherwise.
+ * CREDENTIALS: CASHFREE_PAYOUT_CLIENT_ID / CASHFREE_PAYOUT_CLIENT_SECRET —
+ * Payouts-only. They are deliberately separate from CASHFREE_CLIENT_ID /
+ * CASHFREE_CLIENT_SECRET, which belong to Secure ID (KYC verification,
+ * modules/kyc/providers/cashfree.provider.js): adding Secure ID credentials
+ * must never make Payouts configured. Cashfree issues credentials per
+ * product, so these must belong to an account with the Payouts product
+ * enabled. CASHFREE_ENV (exactly "PRODUCTION" for live) is shared with
+ * Secure ID. Payouts additionally requires the server's outbound IP to be
+ * whitelisted in the Cashfree dashboard — Cashfree answers 403 "IP not
+ * whitelisted" otherwise.
+ *
+ * Without both payout credentials, Payouts is unconfigured and call() makes
+ * NO network request (see below).
  *
  * ENDPOINTS (x-api-version 2024-01-01):
  *   GET  {base}/beneficiary?beneficiary_id=   fetch a beneficiary
@@ -42,10 +48,19 @@ export const getPayoutBaseUrl = () => {
   return isProduction() ? "https://api.cashfree.com/payout" : "https://sandbox.cashfree.com/payout";
 };
 
-export const isCashfreePayoutConfigured = () =>
-  !!process.env.CASHFREE_CLIENT_ID && !!process.env.CASHFREE_CLIENT_SECRET;
+// Payouts-only credentials — never the Secure ID CASHFREE_CLIENT_ID / CASHFREE_CLIENT_SECRET.
+const payoutCredentials = () => ({
+  clientId:     process.env.CASHFREE_PAYOUT_CLIENT_ID,
+  clientSecret: process.env.CASHFREE_PAYOUT_CLIENT_SECRET,
+});
 
-const webhookSecret = () => process.env.CASHFREE_PAYOUT_WEBHOOK_SECRET || process.env.CASHFREE_CLIENT_SECRET || "";
+export const isCashfreePayoutConfigured = () => {
+  const { clientId, clientSecret } = payoutCredentials();
+  return !!clientId && !!clientSecret;
+};
+
+// Falls back to the Payouts client secret only — never to the Secure ID secret.
+const webhookSecret = () => process.env.CASHFREE_PAYOUT_WEBHOOK_SECRET || process.env.CASHFREE_PAYOUT_CLIENT_SECRET || "";
 
 // Deterministic per payout — Cashfree transfer_id: <=40 chars, [A-Za-z0-9_-].
 export const buildTransferId = (payoutId) => `FAP_${String(payoutId)}`;
@@ -62,8 +77,16 @@ export const paiseToRupees = (paise) => Number((paise / 100).toFixed(2));
  * @returns {Promise<{ok:boolean, httpStatus:number|null, json:object, networkError:boolean}>}
  *   networkError:true means the request outcome is UNKNOWN (timeout /
  *   connection error) — the transfer may or may not have been created.
+ *
+ *   Payouts unconfigured: returns at once WITHOUT any network request, as
+ *   an unknown outcome (networkError:true, notConfigured:true) — callers map
+ *   that to PENDING / known:false, never to FAILED, so no money is released.
  */
 const call = async (method, path, body) => {
+  if (!isCashfreePayoutConfigured()) {
+    return { ok: false, httpStatus: null, json: { message: "Cashfree Payouts not configured" }, networkError: true, notConfigured: true };
+  }
+  const { clientId, clientSecret } = payoutCredentials();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
@@ -72,8 +95,8 @@ const call = async (method, path, body) => {
       headers: {
         "Content-Type":    "application/json",
         "x-api-version":   API_VERSION,
-        "x-client-id":     process.env.CASHFREE_CLIENT_ID,
-        "x-client-secret": process.env.CASHFREE_CLIENT_SECRET,
+        "x-client-id":     clientId,
+        "x-client-secret": clientSecret,
       },
       body: body ? JSON.stringify(body) : undefined,
       signal: controller.signal,

@@ -469,9 +469,12 @@ export const assertStagingSafety = (env = process.env) => {
     violations.push("TWILIO_* variables must be unset on staging");
   }
 
-  // R7 — push disabled until isolation is verified.
-  if (isSet(env.PUSH_PROVIDER) && env.PUSH_PROVIDER.trim().toLowerCase() !== "none") {
-    violations.push('PUSH_PROVIDER must be unset or "none" on staging');
+  // R7 — push: unset / "none" (no push) or EXACTLY "expo" (the staging app's real Expo pushes). A push only
+  // reaches device tokens stored in the database this service is pointed at, and that database is already pinned
+  // by R9/R10 (policy, deny-lists, scoped credentials). "expo" is matched exactly because PushProvider compares the
+  // raw value (a variant would silently never push). "fcm" and every credential for it stay refused below.
+  if (isSet(env.PUSH_PROVIDER) && env.PUSH_PROVIDER.trim().toLowerCase() !== "none" && env.PUSH_PROVIDER !== "expo") {
+    violations.push('PUSH_PROVIDER must be unset, "none" or exactly "expo" on staging (the only push provider supported on staging)');
   }
   for (const name of ["EXPO_ACCESS_TOKEN", "FIREBASE_PROJECT_ID", "FIREBASE_CLIENT_EMAIL", "FIREBASE_PRIVATE_KEY"]) {
     if (isSet(env[name])) violations.push(`${name} must be unset on staging`);
