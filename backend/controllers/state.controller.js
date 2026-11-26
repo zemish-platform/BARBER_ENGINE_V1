@@ -4,7 +4,6 @@
  * State Controller — Location Module — 10/10 FROZEN
  */
 
-import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
 import Area from "../models/Area.js";
 import Booking from "../models/Booking.js";
@@ -13,16 +12,17 @@ import Salon from "../models/Salon.js";
 import State from "../models/State.js";
 import User from "../models/User.js";
 import { Errors, successResponse } from "../utils/response.js";
+import { adminAssignmentFields, markAdminAssigned } from "../services/adminCredential.service.js";
+import { revokeAllSessions } from "../services/session.service.js";
+import { logAdminAction } from "../utils/auditLog.js";
+import { AUDIT_ACTIONS } from "../utils/auditActions.js";
 
 const isValidId   = (id)  => mongoose.Types.ObjectId.isValid(id);
 const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-const TEMP_PASSWORD = process.env.ADMIN_RESET_PASSWORD || (() => {
-  if (process.env.NODE_ENV === "production") {
-    throw new Error("ADMIN_RESET_PASSWORD env variable is required in production");
-  }
-  return "Admin@12345";
-})();
+// Admin secure activation: no shared/temporary password exists any more.
+// Newly assigned admins get an unusable password and must activate via OTP
+// (services/adminCredential.service.js).
 
 const SORT_MAP = {
   name:      { name: 1 },
@@ -95,29 +95,33 @@ export const createStateWithAdmin = async (req, res, next) => {
       isActive:   true,
     }], { session });
 
-    const hashedPassword = await bcrypt.hash(TEMP_PASSWORD, 12);
-
     const [admin] = await User.create([{
       name:              adminName,
       phone,
       email:             email?.trim() || null,
-      password:          hashedPassword,
       role:              "ADMIN",
       adminLevel:        "STATE",
       adminSubRole:      "PRIMARY",
       stateRef:          state._id,
       countryRef:        creator.countryRef,
       isVerified:        true,
-      mustResetPassword: true,
+      ...(await adminAssignmentFields(creator._id)),
     }], { session });
 
     await session.commitTransaction();
+
+    logAdminAction({
+      adminId: creator._id, action: AUDIT_ACTIONS.ADMIN_ACCOUNT_ASSIGNED,
+      targetType: "ADMIN_ACCOUNT", targetId: admin._id,
+      meta: { adminLevel: "STATE", stateRef: state._id, via: "createStateWithAdmin" },
+      req,
+    });
 
     return successResponse(res, {
       message: `State "${stateName}" created with STATE admin`,
       data: {
         state: { id: state._id, name: state.name },
-        admin: { id: admin._id, name: admin.name, phone: admin.phone, email: admin.email, adminLevel: admin.adminLevel, tempPassword: TEMP_PASSWORD },
+        admin: { id: admin._id, name: admin.name, phone: admin.phone, email: admin.email, adminLevel: admin.adminLevel, activation: "PENDING_ACTIVATION" },
       },
     });
   } catch (err) {
@@ -853,34 +857,50 @@ export const assignStateBackupAdmin = async (req, res, next) => {
     }
 
     let admin;
+    let credentialsReset = true;
 
     if (existingBackupAdmin) {
-      // EDIT in place — same record, just updated details.
+      // EDIT in place — same record, just updated details. A changed phone
+      // or email (or a never-assigned seed account) is a new employee: the
+      // old credentials are wiped and the new holder must activate via OTP.
+      const newEmail = email?.trim() || null;
+      credentialsReset =
+        existingBackupAdmin.phone !== phone ||
+        (existingBackupAdmin.email || null) !== newEmail ||
+        !existingBackupAdmin.adminAssignedAt;
       existingBackupAdmin.name  = adminName;
       existingBackupAdmin.phone = phone;
-      existingBackupAdmin.email = email?.trim() || null;
+      existingBackupAdmin.email = newEmail;
+      if (credentialsReset) await markAdminAssigned(existingBackupAdmin, req.user?._id);
       await existingBackupAdmin.save({ session });
       admin = existingBackupAdmin;
     } else {
       // No backup admin yet — create a new one.
-      const hashedPassword = await bcrypt.hash(TEMP_PASSWORD, 12);
       [admin] = await User.create([{
         name:               adminName,
         phone,
         email:              email?.trim() || null,
-        password:           hashedPassword,
         role:               "ADMIN",
         adminLevel:         "STATE",
         adminSubRole:       "SUPPORT",
         stateRef:           state._id,
         countryRef:         state.countryRef,
         isEmailVerified:    true,
-        isPhoneVerified:    true,
-        mustChangePassword: true,
+        ...(await adminAssignmentFields(req.user?._id)),
       }], { session });
     }
 
     await session.commitTransaction();
+
+    if (credentialsReset) {
+      await revokeAllSessions(admin._id);
+      logAdminAction({
+        adminId: req.user?._id, action: AUDIT_ACTIONS.ADMIN_ACCOUNT_ASSIGNED,
+        targetType: "ADMIN_ACCOUNT", targetId: admin._id,
+        meta: { adminLevel: "STATE", adminSubRole: "SUPPORT", stateRef: state._id, via: "assignStateBackupAdmin" },
+      req,
+      });
+    }
 
     return successResponse(res, {
       message: existingBackupAdmin

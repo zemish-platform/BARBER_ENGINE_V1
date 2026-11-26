@@ -41,6 +41,11 @@ export const OTP_PURPOSE = Object.freeze({
   // whole point: an assisted-onboarding OTP must never be redeemable
   // as a real owner login credential.
   ASSISTED_ONBOARDING_OWNER_VERIFY: "ASSISTED_ONBOARDING_OWNER_VERIFY",
+  // Admin secure activation (services/adminCredential.service.js). Separate
+  // purposes so an activation OTP can never be redeemed as a reset, and
+  // neither can satisfy any login purpose (Redis key includes the purpose).
+  ADMIN_ACTIVATION: "ADMIN_ACTIVATION",
+  ADMIN_PASSWORD_RESET: "ADMIN_PASSWORD_RESET",
 });
 
 // Which purposes are actually backed by a Redis hash/attempts/cooldown
@@ -52,4 +57,6 @@ export const REDIS_BACKED_PURPOSES = Object.freeze([
   OTP_PURPOSE.FIELD_AGENT_APPLY,
   OTP_PURPOSE.FIELD_AGENT_LOGIN,
   OTP_PURPOSE.ASSISTED_ONBOARDING_OWNER_VERIFY,
+  OTP_PURPOSE.ADMIN_ACTIVATION,
+  OTP_PURPOSE.ADMIN_PASSWORD_RESET,
 ]);

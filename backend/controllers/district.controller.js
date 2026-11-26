@@ -36,7 +36,6 @@
  * shape or the routes.
  */
 
-import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
 import AdminAuditLog from "../models/AdminAuditLog.js";
 import Booking from "../models/Booking.js";
@@ -48,16 +47,15 @@ import User from "../models/User.js";
 import { AUDIT_ACTIONS } from "../utils/auditActions.js";
 import { logAdminAction } from "../utils/auditLog.js";
 import { Errors, successResponse } from "../utils/response.js";
+import { adminAssignmentFields, markAdminAssigned } from "../services/adminCredential.service.js";
+import { revokeAllSessions } from "../services/session.service.js";
 
 const isValidId   = (id)  => mongoose.Types.ObjectId.isValid(id);
 const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-const TEMP_PASSWORD = process.env.ADMIN_RESET_PASSWORD || (() => {
-  if (process.env.NODE_ENV === "production") {
-    throw new Error("ADMIN_RESET_PASSWORD env variable is required in production");
-  }
-  return "Admin@12345";
-})();
+// Admin secure activation: no shared/temporary password exists any more.
+// Newly assigned admins get an unusable password and must activate via OTP
+// (services/adminCredential.service.js).
 
 const SORT_MAP = {
   name:    { name: 1 },
@@ -194,13 +192,10 @@ export const createDistrictWithAdmin = async (req, res, next) => {
       isActive:   true,
     }], { session });
 
-    const hashedPassword = await bcrypt.hash(TEMP_PASSWORD, 12);
-
     const [admin] = await User.create([{
       name:              adminName,
       phone,
       email:             email?.trim() || null,
-      password:          hashedPassword,
       role:              "ADMIN",
       adminLevel:        "DISTRICT",
       adminSubRole:      "PRIMARY",
@@ -208,8 +203,7 @@ export const createDistrictWithAdmin = async (req, res, next) => {
       districtRef:       district._id,
       countryRef:        creator.countryRef,
       isEmailVerified:    true,
-      isPhoneVerified:    false,
-      mustChangePassword: true,
+      ...(await adminAssignmentFields(creator._id)),
     }], { session });
 
     // Link the new admin back onto the district (primaryAdminRef —
@@ -243,7 +237,7 @@ export const createDistrictWithAdmin = async (req, res, next) => {
           phone:        admin.phone,
           email:        admin.email,
           adminLevel:   admin.adminLevel,
-          tempPassword: TEMP_PASSWORD,
+          activation:   "PENDING_ACTIVATION",
         },
       },
     });
@@ -1050,15 +1044,12 @@ export const assignDistrictAdmin = async (req, res, next) => {
 
     if (isPlaceholder) {
       // Convert placeholder in place -- no new ID, no orphaned record.
-      const hashedPassword = await bcrypt.hash(TEMP_PASSWORD, 12);
       existingAdmin.name               = adminName;
       existingAdmin.phone              = phone;
       existingAdmin.email              = email?.trim() || null;
-      existingAdmin.password           = hashedPassword;
       existingAdmin.accountStatus      = "ACTIVE";
       existingAdmin.isEmailVerified    = true;
-      existingAdmin.isPhoneVerified    = false;
-      existingAdmin.mustChangePassword = true;
+      await markAdminAssigned(existingAdmin, req.user.id);
       await existingAdmin.save({ session });
       newAdmin = existingAdmin;
       wasPlaceholderConversion = true;
@@ -1071,12 +1062,10 @@ export const assignDistrictAdmin = async (req, res, next) => {
         await existingAdmin.save({ session });
       }
 
-      const hashedPassword = await bcrypt.hash(TEMP_PASSWORD, 12);
       [newAdmin] = await User.create([{
         name:              adminName,
         phone,
         email:             email?.trim() || null,
-        password:          hashedPassword,
         role:              "ADMIN",
         adminLevel:        "DISTRICT",
         adminSubRole:      "PRIMARY",
@@ -1084,8 +1073,7 @@ export const assignDistrictAdmin = async (req, res, next) => {
         districtRef:       district._id,
         countryRef:        district.countryRef,
         isEmailVerified:    true,
-        isPhoneVerified:    false,
-        mustChangePassword: true,
+        ...(await adminAssignmentFields(req.user.id)),
       }], { session });
     }
 
@@ -1094,6 +1082,10 @@ export const assignDistrictAdmin = async (req, res, next) => {
     await district.save({ session });
 
     await session.commitTransaction();
+
+    // Kill any session held by the converted account or the previous holder.
+    await revokeAllSessions(newAdmin._id);
+    if (existingAdmin && !isPlaceholder) await revokeAllSessions(existingAdmin._id);
 
     logAdminAction({
       adminId: req.user.id,
@@ -1118,7 +1110,7 @@ export const assignDistrictAdmin = async (req, res, next) => {
         admin: {
           id: newAdmin._id, name: newAdmin.name, phone: newAdmin.phone,
           email: newAdmin.email, adminLevel: newAdmin.adminLevel,
-          tempPassword: TEMP_PASSWORD,
+          activation: "PENDING_ACTIVATION",
         },
         previousAdmin: (!isPlaceholder && existingAdmin)
           ? { id: existingAdmin._id, name: existingAdmin.name, status: "DEACTIVATED" }
