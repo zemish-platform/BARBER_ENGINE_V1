@@ -21,6 +21,8 @@
  */
 import mongoose from "mongoose";
 import User from "../models/User.js";
+import State from "../models/State.js";
+import District from "../models/District.js";
 import { AppError, Errors, successResponse } from "../utils/response.js";
 import { logAdminAction } from "../utils/auditLog.js";
 import { AUDIT_ACTIONS } from "../utils/auditActions.js";
@@ -44,7 +46,9 @@ const scopeFilterFor = (caller) => {
   return null;
 };
 
-const toListItem = (a) => ({
+const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const toListItem = (a, names = {}) => ({
   id: a._id,
   name: a.name,
   email: a.email,
@@ -53,6 +57,8 @@ const toListItem = (a) => ({
   adminSubRole: a.adminSubRole || null,
   stateRef: a.stateRef || null,
   districtRef: a.districtRef || null,
+  stateName: (a.stateRef && names[String(a.stateRef)]) || null,
+  districtName: (a.districtRef && names[String(a.districtRef)]) || null,
   status: adminAccountStatus(a),
   assignedAt: a.adminAssignedAt || null,
 });
@@ -90,6 +96,11 @@ export const listAdminAccounts = async (req, res, next) => {
       else return next(Errors.badRequest("status must be UNASSIGNED, PENDING_ACTIVATION or ACTIVE"));
     }
 
+    if (typeof req.query.q === "string" && req.query.q.trim()) {
+      const rx = new RegExp(escapeRegex(req.query.q.trim().slice(0, 60)), "i");
+      filter.$or = [{ name: rx }, { email: rx }];
+    }
+
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 25));
 
@@ -103,9 +114,18 @@ export const listAdminAccounts = async (req, res, next) => {
       User.countDocuments(filter),
     ]);
 
+    // Display names for the page's State/District columns (ids stay the source of truth).
+    const stateIds = [...new Set(items.map((a) => a.stateRef && String(a.stateRef)).filter(Boolean))];
+    const districtIds = [...new Set(items.map((a) => a.districtRef && String(a.districtRef)).filter(Boolean))];
+    const [stateDocs, districtDocs] = await Promise.all([
+      stateIds.length ? State.find({ _id: { $in: stateIds } }).select("name").lean() : [],
+      districtIds.length ? District.find({ _id: { $in: districtIds } }).select("name").lean() : [],
+    ]);
+    const names = Object.fromEntries([...stateDocs, ...districtDocs].map((d) => [String(d._id), d.name]));
+
     return successResponse(res, {
       message: "Admin accounts fetched",
-      data: { items: items.map(toListItem), page, limit, total },
+      data: { items: items.map((a) => toListItem(a, names)), page, limit, total },
     });
   } catch (err) {
     next(err);
