@@ -410,6 +410,88 @@ const KEY = process.env.ADMIN_PANEL_KEY;
   check("14b.1", "every existing-admin update in the seeds leaves name / isActive / phone / email / password untouched", blocks.length === 3 && blocks.every((b) => !/\b(name|isActive|phone|email|password|mustChangePassword)\s*:/.test(b)), blocks.length);
   check("14b.2", "seed STATE PRIMARY lookup filters adminSubRole PRIMARY (cannot grab the backup)", /adminLevel: "STATE",\s*adminSubRole: "PRIMARY",\s*stateRef: state\._id/.test(seedS) && /adminLevel: "STATE",\s*adminSubRole: "PRIMARY",\s*stateRef: state\._id/.test(seedD));
 
+  // ═══ 16. refreshed access tokens + sockets respect the gate ═════
+  // A blocked admin that already holds a refresh session (e.g. signed in
+  // with the seed password before this gate was deployed) must not be able
+  // to mint new access tokens through protect()'s expired-token branch, nor
+  // open an authenticated socket and join the admin room.
+  section("16  blocked admins get no refreshed token and no socket");
+  {
+    const jwt = (await import("jsonwebtoken")).default;
+    const http = await import("node:http");
+    const { createSession } = await import("../services/session.service.js");
+    const { initSocket } = await import("../socket/index.js");
+
+    const fakeReq = { headers: { "user-agent": "ztest-agent", "x-forwarded-for": "10.77.0.1" }, ip: "10.77.0.1" };
+    const expiredToken = (u) => jwt.sign(
+      { id: u._id, role: u.role, tokenVersion: u.tokenVersion ?? 0, adminLevel: u.adminLevel || null, stateRef: u.stateRef || null, exp: Math.floor(Date.now() / 1000) - 60 },
+      process.env.JWT_ACCESS_SECRET, { algorithm: "HS256" });
+    // Raw request so the x-access-token response header (the refreshed token) is visible.
+    const meWithExpired = async (u, refresh) => {
+      const r = await fetch(`http://127.0.0.1:${port}/api/admin/me`, {
+        headers: { Authorization: `Bearer ${expiredToken(u)}`, "x-refresh-token": refresh, "X-Forwarded-For": `10.77.1.${++ipSeq % 250}` },
+      });
+      const text = await r.text();
+      bodies.push(text);
+      let data = {}; try { data = JSON.parse(text); } catch { /* non-JSON */ }
+      return { status: r.status, data, refreshed: r.headers.get("x-access-token") };
+    };
+
+    // Fixtures: a never-assigned placeholder (mustChangePassword=false, like the
+    // 4 staging District placeholders) and an assigned-but-not-yet-activated account.
+    const placeholder = await mkAdmin({ name: "ZT Placeholder", email: "zt-placeholder@ztest.local", phone: "9100000077", adminLevel: "DISTRICT", adminSubRole: "PRIMARY", stateRef: stateB, districtRef: oid(), mustChangePassword: false });
+    const pending = await mkAdmin({ name: "ZT Pending", email: "zt-pending@ztest.local", phone: "9100000078", adminLevel: "DISTRICT", adminSubRole: "PRIMARY", stateRef: stateB, districtRef: oid(), adminAssignedAt: new Date(), adminAssignedBy: india._id });
+    // …and an assigned, activated District admin (its owner set the password).
+    const activated = await mkAdmin({ name: "ZT Activated", email: "zt-activated@ztest.local", phone: "9100000079", adminLevel: "DISTRICT", adminSubRole: "PRIMARY", stateRef: stateB, districtRef: oid(), adminAssignedAt: new Date(), adminAssignedBy: india._id, mustChangePassword: false });
+    const plDoc = await fresh(placeholder._id), peDoc = await fresh(pending._id), inDoc = await fresh(india._id), acDoc = await fresh(activated._id);
+    const plRefresh = await createSession(plDoc, fakeReq);
+    const peRefresh = await createSession(peDoc, fakeReq);
+    const inRefresh = await createSession(inDoc, fakeReq);
+    const acRefresh = await createSession(acDoc, fakeReq);
+
+    const r1 = await meWithExpired(plDoc, plRefresh);
+    check("16.1", "never-assigned placeholder with a live refresh session + expired token → 403, NO refreshed access token", r1.status === 403 && codeOf(r1).includes("ACCOUNT_ACTIVATION_REQUIRED") && !r1.refreshed, { status: r1.status, refreshed: !!r1.refreshed });
+    const r2 = await meWithExpired(peDoc, peRefresh);
+    check("16.2", "assigned-but-pending admin with a live refresh session → 403, NO refreshed access token", r2.status === 403 && !r2.refreshed, { status: r2.status, refreshed: !!r2.refreshed });
+    const r3 = await meWithExpired(inDoc, inRefresh);
+    check("16.3", "activated INDIA admin with expired token + refresh session → 200 and a refreshed access token (unchanged)", r3.status === 200 && !!r3.refreshed, { status: r3.status });
+
+    // Real Socket.IO server (same initSocket as server.js), real EIO4 polling handshake.
+    const sockSrv = http.createServer();
+    const io = initSocket(sockSrv);
+    await new Promise((r) => sockSrv.listen(0, "127.0.0.1", r));
+    const sockBase = `http://127.0.0.1:${sockSrv.address().port}/socket.io/?EIO=4&transport=polling`;
+    const sioConnect = async (token) => {
+      const open = await (await fetch(sockBase)).text();
+      const sid = JSON.parse(open.slice(open.indexOf("{"))).sid;
+      await fetch(`${sockBase}&sid=${sid}`, { method: "POST", headers: { "Content-Type": "text/plain;charset=UTF-8" }, body: `40${JSON.stringify({ token })}` });
+      const reply = await (await fetch(`${sockBase}&sid=${sid}`)).text();
+      return { connected: /(^|\x1e)40\{/.test(reply), refused: /(^|\x1e)44\{.*AUTH_FAILED/.test(reply) };
+    };
+    const adminRoomSize = async () => (await io.in("admin").fetchSockets()).length;
+    try {
+      const s1 = await sioConnect(generateAccessToken(plDoc));
+      check("16.4", "placeholder with a valid, unexpired access token → socket refused (AUTH_FAILED)", s1.refused && !s1.connected, s1);
+      const s2 = await sioConnect(generateAccessToken(peDoc));
+      check("16.5", "assigned-but-pending admin → socket refused (AUTH_FAILED)", s2.refused && !s2.connected, s2);
+      check("16.6", "…neither blocked admin is in the admin room", (await adminRoomSize()) === 0);
+      const s3 = await sioConnect(generateAccessToken(inDoc));
+      check("16.7", "activated INDIA admin → socket connects (unchanged)", s3.connected && !s3.refused, s3);
+      await new Promise((r) => setTimeout(r, 100));
+      check("16.8", "…and joins the admin room", (await adminRoomSize()) === 1);
+      await new Promise((r) => setTimeout(r, 50));
+      const s4 = await sioConnect(generateAccessToken(acDoc));
+      check("16.9", "assigned + activated DISTRICT admin → socket connects (unchanged)", s4.connected && !s4.refused, s4);
+      await new Promise((r) => setTimeout(r, 100));
+      check("16.9b", "…and joins the admin room (2 admins now, still no blocked one)", (await adminRoomSize()) === 2);
+      const r4 = await meWithExpired(acDoc, acRefresh);
+      check("16.10", "…and its expired access token is still refreshed → 200 + new token (unchanged)", r4.status === 200 && !!r4.refreshed, { status: r4.status });
+    } finally {
+      io.disconnectSockets(true);
+      await new Promise((r) => io.close(() => r()));
+    }
+  }
+
   // ═══ 15. limiter + no secret leakage ════════════════════════════
   section("15  rate limit and no OTP/password leakage");
   let limited = false;

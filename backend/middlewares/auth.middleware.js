@@ -61,6 +61,18 @@ export const protect = async (req, res, next) => {
         return next(Errors.unauthorized("Session expired"));
       }
 
+      // Admin secure activation: an ADMIN account pending activation (or a
+      // never-assigned State/District placeholder) must not be handed a fresh
+      // access token from an old refresh session — refuse BEFORE issuing one.
+      if (isAdminActivationBlocked(session.user)) {
+        logger.warn("Refused token refresh for admin account pending activation", {
+          userId: session.user._id.toString(),
+        });
+        return next(
+          new AppError("Account activation required", 403, "ACCOUNT_ACTIVATION_REQUIRED")
+        );
+      }
+
       //////////////////////////////////////////////////////
       // ISSUE NEW ACCESS TOKEN
       //////////////////////////////////////////////////////

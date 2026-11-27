@@ -100,6 +100,7 @@ import Booking from "../models/Booking.js";
 import User    from "../models/User.js";
 import SupportTeam from "../modules/support/models/SupportTeam.js";
 import { isStrictCorsEnv } from "../utils/stagingGuards.js"; // staging-only strict CORS (production already strict)
+import { isAdminActivationBlocked } from "../utils/adminActivationGate.js";
 
 //////////////////////////////////////////////////////////////
 // 🔥 CONFIG
@@ -208,7 +209,7 @@ const authMiddleware = async (socket, next) => {
   // flow to do a real verifySession() with.
   let user;
   try {
-    user = await User.findById(userId).select("tokenVersion isActive isDeleted accountStatus");
+    user = await User.findById(userId).select("role adminLevel tokenVersion isActive isDeleted accountStatus mustChangePassword adminAssignedAt");
   } catch (err) {
     console.warn("[Socket] User lookup failed during auth:", err.message);
     return next(new Error("AUTH_FAILED"));
@@ -226,6 +227,13 @@ const authMiddleware = async (socket, next) => {
   }
 
   if (Number(payload.tokenVersion ?? 0) !== Number(user.tokenVersion ?? 0)) {
+    return next(new Error("AUTH_FAILED"));
+  }
+
+  // Admin secure activation — same rule as REST protect(): an ADMIN account
+  // pending activation, or a never-assigned State/District placeholder, must
+  // not connect (so it never joins the admin room or syncs bookings).
+  if (isAdminActivationBlocked(user)) {
     return next(new Error("AUTH_FAILED"));
   }
 
