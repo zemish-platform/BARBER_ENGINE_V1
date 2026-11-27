@@ -624,7 +624,14 @@ await test("G8", "drift guard: the in-code fallbacks the boot guard rejects stil
   const district = fs.readFileSync(path.join(BACKEND_DIR, "controllers/district.controller.js"), "utf8");
   expect(booking.includes('"otp-fallback-secret-change-in-prod"'), "OTP_SECRET fallback literal changed — update stagingGuards.js");
   expect(booking.includes('"barber-engine-otp-key-32-chars!!"'), "OTP_ENCRYPT_KEY fallback literal changed — update stagingGuards.js");
-  expect(district.includes('"Admin@12345"'), "ADMIN_RESET_PASSWORD default changed — update stagingGuards.js");
+  // Admin secure activation removed the shared ADMIN_RESET_PASSWORD temp password
+  // from the district/state controllers entirely (OTP activation instead); the
+  // boot guard's ADMIN_RESET_PASSWORD check is now belt-and-braces only.
+  const state = fs.readFileSync(path.join(BACKEND_DIR, "controllers/state.controller.js"), "utf8");
+  for (const [name, src] of [["district", district], ["state", state]]) {
+    expect(!src.includes('"Admin@12345"') && !src.includes("ADMIN_RESET_PASSWORD") && !src.includes("tempPassword"),
+      `${name}.controller.js reintroduced a shared admin temp password`);
+  }
 });
 
 await test("G5", "server.js: unsafe staging exits 1 BEFORE app/Redis/Mongo side effects (child process; control proves the assertion can fail)", async () => {

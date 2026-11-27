@@ -36,7 +36,6 @@
  * shape or the routes.
  */
 
-import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
 import AdminAuditLog from "../models/AdminAuditLog.js";
 import Booking from "../models/Booking.js";
@@ -48,16 +47,15 @@ import User from "../models/User.js";
 import { AUDIT_ACTIONS } from "../utils/auditActions.js";
 import { logAdminAction } from "../utils/auditLog.js";
 import { Errors, successResponse } from "../utils/response.js";
+import { adminAssignmentFields, markAdminAssigned } from "../services/adminCredential.service.js";
+import { revokeAllSessions } from "../services/session.service.js";
 
 const isValidId   = (id)  => mongoose.Types.ObjectId.isValid(id);
 const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-const TEMP_PASSWORD = process.env.ADMIN_RESET_PASSWORD || (() => {
-  if (process.env.NODE_ENV === "production") {
-    throw new Error("ADMIN_RESET_PASSWORD env variable is required in production");
-  }
-  return "Admin@12345";
-})();
+// Admin secure activation: no shared/temporary password exists any more.
+// Newly assigned admins get an unusable password and must activate via OTP
+// (services/adminCredential.service.js).
 
 const SORT_MAP = {
   name:    { name: 1 },
@@ -194,13 +192,10 @@ export const createDistrictWithAdmin = async (req, res, next) => {
       isActive:   true,
     }], { session });
 
-    const hashedPassword = await bcrypt.hash(TEMP_PASSWORD, 12);
-
     const [admin] = await User.create([{
       name:              adminName,
       phone,
       email:             email?.trim() || null,
-      password:          hashedPassword,
       role:              "ADMIN",
       adminLevel:        "DISTRICT",
       adminSubRole:      "PRIMARY",
@@ -208,8 +203,7 @@ export const createDistrictWithAdmin = async (req, res, next) => {
       districtRef:       district._id,
       countryRef:        creator.countryRef,
       isEmailVerified:    true,
-      isPhoneVerified:    false,
-      mustChangePassword: true,
+      ...(await adminAssignmentFields(creator._id)),
     }], { session });
 
     // Link the new admin back onto the district (primaryAdminRef —
@@ -243,7 +237,7 @@ export const createDistrictWithAdmin = async (req, res, next) => {
           phone:        admin.phone,
           email:        admin.email,
           adminLevel:   admin.adminLevel,
-          tempPassword: TEMP_PASSWORD,
+          activation:   "PENDING_ACTIVATION",
         },
       },
     });
@@ -1009,9 +1003,23 @@ export const assignDistrictAdmin = async (req, res, next) => {
     }
     phone = cleanPhone;
 
-    const existingAdmin = district.primaryAdminRef
+    // The district's existing PRIMARY admin account (seeded placeholder or a
+    // real holder). It is always REUSED — same _id, stateRef, districtRef,
+    // adminLevel — never duplicated. If primaryAdminRef is stale, fall back to
+    // the live PRIMARY account for this district.
+    let existingAdmin = district.primaryAdminRef
       ? await User.findById(district.primaryAdminRef).session(session)
       : null;
+    if (existingAdmin && (existingAdmin.isDeleted === true || existingAdmin.role !== "ADMIN" ||
+        existingAdmin.adminLevel !== "DISTRICT" || String(existingAdmin.districtRef) !== String(district._id))) {
+      existingAdmin = null;
+    }
+    if (!existingAdmin) {
+      existingAdmin = await User.findOne({
+        role: "ADMIN", adminLevel: "DISTRICT", adminSubRole: "PRIMARY",
+        districtRef: district._id, isDeleted: { $ne: true },
+      }).session(session);
+    }
 
     const [existingPhone, existingEmail] = await Promise.all([
       User.findOne({
@@ -1035,48 +1043,36 @@ export const assignDistrictAdmin = async (req, res, next) => {
       return next(Errors.conflict("Email already linked to another admin account"));
     }
 
-    // Is the existing admin a placeholder (seed-time ghost, phone
-    // never set) or a real person (genuine transfer)? Placeholder
-    // admins get UPDATED in place -- their ID already exists and is
-    // already linked to this district, so overwriting is correct and
-    // avoids leaving 778 orphaned SUSPENDED user records behind.
-    // Real transfers keep the old create-new + deactivate-old
-    // behavior, to preserve who genuinely held the role historically.
-    const isPlaceholder = existingAdmin && !existingAdmin.phone;
-
+    // Placeholder (seeded, phone never set) vs. real transfer (a previous
+    // employee held it). BOTH are handled in place: the account keeps its _id
+    // and hierarchy links; the previous holder's credentials die because
+    // markAdminAssigned() replaces the password and every session is revoked
+    // below. Who held it before is preserved in the audit log.
+    const isPlaceholder = !!existingAdmin && !existingAdmin.phone;
+    const wasTransfer = !!existingAdmin && !isPlaceholder;
+    const previousHolder = wasTransfer
+      ? { name: existingAdmin.name, phone: `******${String(existingAdmin.phone).slice(-4)}` }
+      : null;
 
     let newAdmin;
-    let wasPlaceholderConversion = false;
+    const wasPlaceholderConversion = isPlaceholder;
 
-    if (isPlaceholder) {
-      // Convert placeholder in place -- no new ID, no orphaned record.
-      const hashedPassword = await bcrypt.hash(TEMP_PASSWORD, 12);
+    if (existingAdmin) {
       existingAdmin.name               = adminName;
       existingAdmin.phone              = phone;
       existingAdmin.email              = email?.trim() || null;
-      existingAdmin.password           = hashedPassword;
       existingAdmin.accountStatus      = "ACTIVE";
       existingAdmin.isEmailVerified    = true;
-      existingAdmin.isPhoneVerified    = false;
-      existingAdmin.mustChangePassword = true;
+      await markAdminAssigned(existingAdmin, req.user.id);
       await existingAdmin.save({ session });
       newAdmin = existingAdmin;
-      wasPlaceholderConversion = true;
     } else {
-      // Real transfer (existing admin already had a real phone) OR
-      // no existing admin at all -- original create-new behavior.
-      if (existingAdmin) {
-        existingAdmin.accountStatus = "SUSPENDED";
-        existingAdmin.isDeleted     = true;
-        await existingAdmin.save({ session });
-      }
-
-      const hashedPassword = await bcrypt.hash(TEMP_PASSWORD, 12);
+      // No DISTRICT PRIMARY account exists at all for this district — the only
+      // case that creates one (nothing to duplicate).
       [newAdmin] = await User.create([{
         name:              adminName,
         phone,
         email:             email?.trim() || null,
-        password:          hashedPassword,
         role:              "ADMIN",
         adminLevel:        "DISTRICT",
         adminSubRole:      "PRIMARY",
@@ -1084,8 +1080,7 @@ export const assignDistrictAdmin = async (req, res, next) => {
         districtRef:       district._id,
         countryRef:        district.countryRef,
         isEmailVerified:    true,
-        isPhoneVerified:    false,
-        mustChangePassword: true,
+        ...(await adminAssignmentFields(req.user.id)),
       }], { session });
     }
 
@@ -1095,6 +1090,9 @@ export const assignDistrictAdmin = async (req, res, next) => {
 
     await session.commitTransaction();
 
+    // Kill every session on the account (incl. a previous holder's).
+    await revokeAllSessions(newAdmin._id);
+
     logAdminAction({
       adminId: req.user.id,
       action: AUDIT_ACTIONS.DISTRICT_ADMIN_ASSIGNED,
@@ -1102,15 +1100,16 @@ export const assignDistrictAdmin = async (req, res, next) => {
       targetId: district._id,
       meta: {
         newAdminId: newAdmin._id, newAdminName: newAdmin.name,
-        previousAdminId: wasPlaceholderConversion ? null : (existingAdmin?._id || null),
-        wasTransfer: !isPlaceholder && !!existingAdmin,
+        previousAdminId: null, // account reused in place — same _id
+        previousHolder,
+        wasTransfer,
         wasPlaceholderConversion,
       },
       req,
     });
 
     return successResponse(res, {
-      message: (!isPlaceholder && existingAdmin)
+      message: wasTransfer
         ? `District admin transferred for "${district.name}"`
         : `District admin assigned for "${district.name}"`,
       data: {
@@ -1118,10 +1117,10 @@ export const assignDistrictAdmin = async (req, res, next) => {
         admin: {
           id: newAdmin._id, name: newAdmin.name, phone: newAdmin.phone,
           email: newAdmin.email, adminLevel: newAdmin.adminLevel,
-          tempPassword: TEMP_PASSWORD,
+          activation: "PENDING_ACTIVATION",
         },
-        previousAdmin: (!isPlaceholder && existingAdmin)
-          ? { id: existingAdmin._id, name: existingAdmin.name, status: "DEACTIVATED" }
+        previousAdmin: wasTransfer
+          ? { id: newAdmin._id, name: previousHolder.name, status: "REPLACED" }
           : null,
       },
     });

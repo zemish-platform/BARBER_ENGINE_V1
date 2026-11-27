@@ -29,6 +29,7 @@ import {
   listWallets
 } from "../controllers/adminFinance.controller.js";
 import { getAdminMe } from "../controllers/adminMe.controller.js";
+import { assignAdminAccount, listAdminAccounts } from "../controllers/adminAccount.controller.js";
 import {
   getProviderDetail,
   getProvidersSummary,
@@ -137,6 +138,12 @@ router.use(protect, requireRole("ADMIN"));
 
 // ── Auth ──────────────────────────────────────────────────
 router.get("/me", asyncHandler(getAdminMe));
+
+// ── Admin accounts: secure assignment (OTP activation) ────
+// Scope enforced in the controller: INDIA → STATE/DISTRICT accounts;
+// STATE → DISTRICT accounts in its own state; DISTRICT → none.
+router.get ("/admin-accounts",            requireAdminLevel("INDIA","STATE"), asyncHandler(listAdminAccounts));
+router.post("/admin-accounts/:id/assign", requireAdminLevel("INDIA","STATE"), asyncHandler(assignAdminAccount));
 
 // ── Dashboard (stub) ──────────────────────────────────────
 router.get("/dashboard", asyncHandler(async (req, res) => {

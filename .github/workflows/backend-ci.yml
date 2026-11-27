@@ -1,7 +1,8 @@
 name: Backend CI
 
-# Read-only validation of the backend. No deployment, no secrets, no database,
-# no production access. Runs only checks that need nothing but the repository.
+# Read-only validation of the backend. No deployment, no secrets, no production
+# access. backend-ci needs nothing but the repository; backend-db-suites uses
+# throwaway MongoDB/Redis containers that live only inside the job.
 on:
   pull_request:
     branches: [main, develop]
@@ -82,3 +83,77 @@ jobs:
           RAZORPAY_KEY_ID: ci-placeholder
           RAZORPAY_KEY_SECRET: ci-placeholder
         run: node --input-type=module -e 'await import("./app.js"); console.log("app import ok"); process.exit(0)'
+
+  # Hermetic, database-backed suites: throwaway MongoDB (single-node replica set, needed for
+  # transactions) and Redis containers that exist only inside this job, on non-default loopback
+  # ports. The scripts refuse any other target (loopback + non-default port + ztest_* database +
+  # no credentials) and drop only their own ztest_ database. No secrets, no staging/production access.
+  backend-db-suites:
+    name: backend-db-suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      ZTEST_REDIS_URL: redis://127.0.0.1:36479
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies (lockfile only)
+        run: npm ci --no-audit --no-fund
+
+      - name: Start throwaway MongoDB replica set + Redis
+        working-directory: .
+        run: |
+          docker run -d --name ztest-mongo -p 127.0.0.1:37217:37217 mongo:7 \
+            mongod --replSet rsz --port 37217 --bind_ip_all
+          docker run -d --name ztest-redis -p 127.0.0.1:36479:6379 redis:7 \
+            redis-server --save "" --appendonly no
+          for i in $(seq 1 60); do
+            docker exec ztest-mongo mongosh --quiet --port 37217 --eval 'db.runCommand({ping:1}).ok' >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec ztest-mongo mongosh --quiet --port 37217 --eval \
+            'rs.initiate({_id:"rsz",members:[{_id:0,host:"127.0.0.1:37217"}]}).ok'
+          for i in $(seq 1 60); do
+            [ "$(docker exec ztest-mongo mongosh --quiet --port 37217 --eval 'rs.status().myState' 2>/dev/null)" = "1" ] && break
+            sleep 1
+          done
+          [ "$(docker exec ztest-mongo mongosh --quiet --port 37217 --eval 'rs.status().myState')" = "1" ] || { echo "replica set not PRIMARY"; exit 1; }
+          for i in $(seq 1 30); do
+            [ "$(docker exec ztest-redis redis-cli ping 2>/dev/null)" = "PONG" ] && break
+            sleep 1
+          done
+          [ "$(docker exec ztest-redis redis-cli ping)" = "PONG" ] || { echo "redis not ready"; exit 1; }
+
+      - name: Admin secure activation suite (scripts/verifyAdminActivation.js)
+        env:
+          ZTEST_MONGO_URI: mongodb://127.0.0.1:37217/ztest_admin_activation?replicaSet=rsz
+        run: node scripts/verifyAdminActivation.js
+
+      - name: Wallet top-up captured-credit regression (scripts/verifyWalletTopupCredit.js)
+        if: success() || failure()
+        env:
+          ZTEST_MONGO_URI: mongodb://127.0.0.1:37217/ztest_wallet_topup?replicaSet=rsz
+        run: node scripts/verifyWalletTopupCredit.js
+
+      - name: Container logs on failure
+        if: failure()
+        working-directory: .
+        run: docker logs --tail 80 ztest-mongo || true
+
+      - name: Remove throwaway containers
+        if: always()
+        working-directory: .
+        run: docker rm -f ztest-mongo ztest-redis || true

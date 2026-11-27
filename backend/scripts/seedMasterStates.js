@@ -169,9 +169,12 @@ async function seedStates() {
       //////////////////////////////////////////////////////
       // STATE ADMIN
       //////////////////////////////////////////////////////
+      // PRIMARY only — without the sub-role filter this could match the
+      // SUPPORT (backup) admin and flip it to PRIMARY.
       const existingStateAdmin = await User.findOne({
         role: "ADMIN",
         adminLevel: "STATE",
+        adminSubRole: "PRIMARY",
         stateRef: state._id,
         isDeleted: false,
       });
@@ -249,14 +252,14 @@ async function seedStates() {
         //////////////////////////////////////////////////////
         // UPDATE ADMIN (SAFE)
         //////////////////////////////////////////////////////
+        // Existing account is REUSED as-is: same _id, and its name, phone,
+        // email, password, assignment and enabled/disabled status are never
+        // overwritten (an assigned employee must not be renamed back to the
+        // placeholder, and a disabled account must stay disabled).
         await User.updateOne(
           { _id: existingStateAdmin._id },
           {
             $set: {
-              name: `${state.name} STATE ADMIN`,
-              adminSubRole: "PRIMARY",
-              isActive: true,
-              isDeleted: false,
               permissions: ["STATE_FULL_ACCESS"],
             },
           }
@@ -344,13 +347,11 @@ async function seedStates() {
         //////////////////////////////////////////////////////
         // UPDATE BACKUP ADMIN (SAFE)
         //////////////////////////////////////////////////////
+        // Reused as-is (see the PRIMARY branch above).
         await User.updateOne(
           { _id: existingBackupAdmin._id },
           {
             $set: {
-              name: `${state.name} STATE BACKUP ADMIN`,
-              isActive: true,
-              isDeleted: false,
               permissions: ["STATE_FULL_ACCESS"],
             },
           }

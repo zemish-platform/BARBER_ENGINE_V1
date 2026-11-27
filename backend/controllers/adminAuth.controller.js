@@ -8,6 +8,12 @@ import {
   rotateSession,
 } from "../services/session.service.js";
 import { generateAccessToken } from "../services/token.service.js";
+import { isAdminActivationBlocked } from "../utils/adminActivationGate.js";
+import {
+  GENERIC_REQUEST_MESSAGE,
+  completeCredentialSet,
+  requestCredentialOtp,
+} from "../services/adminCredential.service.js";
 import logger from "../utils/logger.js";
 import {
   AppError,
@@ -119,6 +125,22 @@ export const adminLogin = async (req, res, next) => {
       ) {
         return next(Errors.unauthorized("Invalid admin key"));
       }
+    }
+
+    //////////////////////////////////////////////////////
+    // SECURE ACTIVATION GATE (server-side, never UI-only)
+    // A seeded/assigned account whose owner has not yet set
+    // their own password via OTP gets no session at all.
+    //////////////////////////////////////////////////////
+
+    if (isAdminActivationBlocked(admin)) {
+      return next(
+        new AppError(
+          "Account activation required. Verify your phone with OTP to set your password.",
+          403,
+          "ACCOUNT_ACTIVATION_REQUIRED"
+        )
+      );
     }
 
     //////////////////////////////////////////////////////
@@ -368,3 +390,85 @@ export const adminRefresh = async (req, res, next) => {
     next(err);
   }
 };
+
+// ─── SECURE ACTIVATION / PASSWORD RESET (OTP) ─────────────────────
+//
+// Public, rate-limited. See services/adminCredential.service.js.
+// Responses never contain the OTP, the password, or whether a phone
+// belongs to an (eligible) admin account.
+//////////////////////////////////////////////////////////////
+
+const noStore = (res) =>
+  res.set({ "Cache-Control": "no-store", Pragma: "no-cache" });
+
+const credentialOtpRequestHandler = (kind) => async (req, res, next) => {
+  try {
+    noStore(res);
+    const redis = req.redis;
+    if (!redis) return next(new AppError("Service temporarily unavailable. Please try again.", 503, "SERVICE_UNAVAILABLE"));
+    const result = await requestCredentialOtp({
+      kind,
+      phone: req.body?.phone,
+      req,
+      redis,
+    });
+    if (!result.ok) {
+      if (result.code === "INVALID_PHONE") {
+        return next(Errors.badRequest("A valid 10-digit mobile number is required"));
+      }
+      if (result.code === "RESEND_TOO_SOON") {
+        return next(
+          new AppError(
+            `Please wait ${result.retryAfterSeconds || 30} seconds before requesting another OTP`,
+            429,
+            "RESEND_TOO_SOON"
+          )
+        );
+      }
+      return next(new AppError("Could not send OTP. Try again later.", 503, "SMS_SEND_FAILED"));
+    }
+    return successResponse(res, { message: GENERIC_REQUEST_MESSAGE, data: null });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const credentialCompleteHandler = (kind) => async (req, res, next) => {
+  try {
+    noStore(res);
+    const redis = req.redis;
+    if (!redis) return next(new AppError("Service temporarily unavailable. Please try again.", 503, "SERVICE_UNAVAILABLE"));
+    const { phone, otp, newPassword } = req.body || {};
+    const result = await completeCredentialSet({
+      kind,
+      phone,
+      otp: typeof otp === "number" ? String(otp) : otp,
+      newPassword,
+      req,
+      redis,
+    });
+    if (!result.ok) {
+      return next(new AppError(result.message, result.status, result.code));
+    }
+    // Every old session is dead; the client must log in again with the new password.
+    res.clearCookie("refreshToken", getClearRefreshCookieOptions());
+    return successResponse(res, {
+      message:
+        kind === "ACTIVATION"
+          ? "Account activated. Please log in with your new password."
+          : "Password reset. Please log in with your new password.",
+      data: null,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// POST /api/admin-auth/activation/request-otp      { phone }
+export const adminActivationRequestOtp = credentialOtpRequestHandler("ACTIVATION");
+// POST /api/admin-auth/activation/complete         { phone, otp, newPassword }
+export const adminActivationComplete = credentialCompleteHandler("ACTIVATION");
+// POST /api/admin-auth/password-reset/request-otp  { phone }
+export const adminPasswordResetRequestOtp = credentialOtpRequestHandler("RESET");
+// POST /api/admin-auth/password-reset/complete     { phone, otp, newPassword }
+export const adminPasswordResetComplete = credentialCompleteHandler("RESET");

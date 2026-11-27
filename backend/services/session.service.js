@@ -1,3 +1,4 @@
+import { isAdminActivationBlocked } from "../utils/adminActivationGate.js";
 import crypto from "crypto";
 import mongoose from "mongoose";
 import redis from "../config/redis.js";
@@ -156,7 +157,7 @@ export const verifySession = async (rawToken) => {
       const parsed = JSON.parse(cached);
 
       const user = await User.findById(parsed.userId).select(
-        "_id role tokenVersion isActive isDeleted accountStatus adminLevel countryRef stateRef districtRef cityRef"
+        "_id role tokenVersion isActive isDeleted accountStatus mustChangePassword adminAssignedAt adminLevel countryRef stateRef districtRef cityRef"
       );
 
       if (!user) return null;
@@ -199,7 +200,7 @@ export const verifySession = async (rawToken) => {
   if (compromisedFamily) return null;
 
   const user = await User.findById(tokenDoc.userRef).select(
-    "_id role tokenVersion isActive isDeleted accountStatus adminLevel countryRef stateRef districtRef cityRef"
+    "_id role tokenVersion isActive isDeleted accountStatus mustChangePassword adminAssignedAt adminLevel countryRef stateRef districtRef cityRef"
   );
 
   if (!user) return null;
@@ -284,12 +285,15 @@ export const rotateSession = async (rawToken, req) => {
   if (existingToken.isCompromised) return null;
 
   const user = await User.findById(existingToken.userRef).select(
-    "_id role tokenVersion isActive isDeleted accountStatus adminLevel countryRef stateRef districtRef cityRef"
+    "_id role tokenVersion isActive isDeleted accountStatus mustChangePassword adminAssignedAt adminLevel countryRef stateRef districtRef cityRef"
   );
 
   if (!user) return null;
   if (!user.isActive || user.isDeleted) return null;
   if (user.accountStatus === "SUSPENDED" || user.accountStatus === "BLOCKED") return null;
+  // Admin secure activation: an ADMIN account pending activation can never
+  // hold a live session (see services/adminCredential.service.js).
+  if (isAdminActivationBlocked(user)) return null;
   if (Number(user.tokenVersion) !== Number(existingToken.tokenVersion))
     return null;
 

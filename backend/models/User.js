@@ -162,6 +162,25 @@ const UserSchema = new mongoose.Schema(
       default: false,
     },
 
+    // Admin secure activation (additive). Set when an authorized admin assigns
+    // an employee to a State/District admin account (see
+    // services/adminCredential.service.js). A STATE/DISTRICT account with no
+    // adminAssignedAt can never be activated — knowing a seed-generated email
+    // or phone is not enough.
+    adminAssignedAt: {
+      type: Date,
+      default: null,
+    },
+    adminAssignedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    passwordChangedAt: {
+      type: Date,
+      default: null,
+    },
+
     lastLoginAt: {
       type: Date,
       default: null,
